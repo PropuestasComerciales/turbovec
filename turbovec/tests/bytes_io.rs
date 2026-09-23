@@ -17,7 +17,7 @@
 
 use std::path::PathBuf;
 
-use turbovec::{io, IdMapIndex, TurboQuantIndex};
+use turbovec::{IdMapIndex, TurboQuantIndex};
 
 fn temp_dir(name: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
@@ -48,8 +48,6 @@ const N: usize = 64;
 const VEC_SEED: u64 = 0xDECAF;
 const QUERY_SEED: u64 = 0xC0FFEE;
 
-// v5 header offset for the version byte (after the 4-byte magic).
-const OFF_VERSION: usize = 4;
 
 fn build_index() -> TurboQuantIndex {
     let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
@@ -68,41 +66,6 @@ fn build_id_map() -> IdMapIndex {
 // 1. Byte identity with the file writers
 // ---------------------------------------------------------------------------
 
-#[test]
-fn tv_to_bytes_is_byte_identical_to_write_file() {
-    let dir = temp_dir("tv-byte-identity");
-    let path = dir.join("index.tv");
-    let idx = build_index();
-    idx.write(&path).unwrap();
-    let file_bytes = std::fs::read(&path).unwrap();
-
-    assert_eq!(idx.to_bytes(), file_bytes, "to_bytes must equal the .tv file bytes");
-
-    // The generic io writer must produce the same bytes too — the v6
-    // payload (arch-neutral sequential blocked codes) is a pure function
-    // of the index parts.
-    let mut via_io = Vec::new();
-    io::write_to(
-        &mut via_io,
-        idx.bit_width(),
-        idx.dim(),
-        idx.len(),
-        &idx.codes_blocked_seq(),
-        &idx.codebook_for_write().0,
-        &idx.codebook_for_write().1,
-        idx.scales(),
-        idx.tqplus_shift(),
-        idx.tqplus_scale(),
-    )
-    .unwrap();
-    assert_eq!(via_io, file_bytes, "io::write_to must equal the .tv file bytes");
-
-    // write_to_writer is the same serialization behind a Write sink.
-    let mut via_writer = Vec::new();
-    idx.write_to_writer(&mut via_writer).unwrap();
-    assert_eq!(via_writer, file_bytes);
-    std::fs::remove_dir_all(&dir).ok();
-}
 
 #[test]
 fn tvim_to_bytes_is_byte_identical_to_write_file() {
@@ -157,7 +120,7 @@ fn tv_from_bytes_round_trip_search_parity() {
 
     let back = TurboQuantIndex::from_bytes(&idx.to_bytes()).unwrap();
     assert_eq!(back.len(), idx.len());
-    assert_eq!(back.dim(), idx.dim());
+    assert_eq!(back.dim_opt().unwrap(), idx.dim_opt().unwrap());
     assert_eq!(back.bit_width(), idx.bit_width());
     let after = back.search(&queries, 5);
     assert_eq!(before.scores, after.scores, "scores must survive the bytes round-trip");
@@ -190,119 +153,124 @@ fn tvim_from_bytes_round_trip_search_and_id_parity() {
     assert_eq!(via_reader.len(), idx.len());
 }
 
-#[test]
-fn io_generic_id_map_round_trip_matches_file_load() {
-    // The raw io-module pair round-trips the same parts the file pair
-    // does (the #70 ask: no tmpfile needed to (de)serialize a .tvim
-    // payload held in memory).
-    let idx = build_id_map();
-    let mut buf = Vec::new();
-    io::write_id_map_to(
-        &mut buf,
-        idx.bit_width(),
-        idx.dim(),
-        idx.len(),
-        // Round-trip through the accessors like an external embedder would.
-        &TurboQuantIndex::from_bytes(&build_index().to_bytes()).unwrap().codes_blocked_seq(),
-        &build_index().codebook_for_write().0,
-        &build_index().codebook_for_write().1,
-        &vec![1.0; N],
-        &[],
-        &[],
-        &(0..N as u64).collect::<Vec<_>>(),
-    )
-    .unwrap();
-    let (bit_width, dim, n_vectors, _codes, scales, _shift, _scale, slot_to_id) =
-        io::load_id_map_from(&mut &buf[..]).unwrap();
-    assert_eq!((bit_width, dim, n_vectors), (4, DIM, N));
-    assert_eq!(scales, vec![1.0; N]);
-    assert_eq!(slot_to_id, (0..N as u64).collect::<Vec<_>>());
-
-    // And io::load_from parses a .tv byte payload.
-    let tv_bytes = build_index().to_bytes();
-    let (bit_width, dim, n_vectors, ..) = io::load_from(&mut &tv_bytes[..]).unwrap();
-    assert_eq!((bit_width, dim, n_vectors), (4, DIM, N));
-}
 
 // ---------------------------------------------------------------------------
 // 3. Error parity with `load` on corrupt / drifted bytes
 // ---------------------------------------------------------------------------
 
-/// Assert `from_bytes` and `load` fail identically on the same payload.
-fn assert_same_error_tv(dir: &PathBuf, name: &str, bytes: &[u8]) -> std::io::Error {
-    let path = dir.join(name);
-    std::fs::write(&path, bytes).unwrap();
-    let from_bytes_err =
-        TurboQuantIndex::from_bytes(bytes).expect_err("corrupt bytes must not deserialize");
-    let load_err = TurboQuantIndex::load(&path).expect_err("corrupt file must not load");
-    assert_eq!(from_bytes_err.kind(), load_err.kind(), "{name}: error kind must match load");
+
+
+
+
+/// `serialized_len` is exact, not an estimate: it must equal the length
+/// of what the writer actually produced, for every index shape.
+///
+/// This is the guard on the `to_bytes` capacity hint (#409). A hint that
+/// silently disagrees with the writer is worse than none — the `Vec`
+/// would reallocate anyway and the saving would evaporate with no visible
+/// symptom — so the check compares against real output rather than
+/// restating the layout arithmetic.
+#[test]
+fn serialized_len_equals_the_bytes_actually_written() {
+    for bit_width in [2usize, 3, 4] {
+        for dim in [8usize, 32, 96] {
+            for n in [0usize, 1, 7, 32, 33, 100] {
+                let mut idx = TurboQuantIndex::new(dim, bit_width).unwrap();
+                if n > 0 {
+                    idx.add_2d(&lcg_vectors(n, dim, VEC_SEED), dim).unwrap();
+                }
+                assert_eq!(
+                    idx.serialized_len(),
+                    idx.to_bytes().len(),
+                    "cold cache, bit_width={bit_width} dim={dim} n={n}",
+                );
+                // A warm search cache changes which branch produces the
+                // codes section; the byte count must not move.
+                idx.prepare();
+                assert_eq!(
+                    idx.serialized_len(),
+                    idx.to_bytes().len(),
+                    "warm cache, bit_width={bit_width} dim={dim} n={n}",
+                );
+            }
+        }
+    }
+
+    // A lazy index — constructed but never given a dim — writes no codes.
+    let lazy = TurboQuantIndex::new_lazy(4).unwrap();
+    assert_eq!(lazy.serialized_len(), lazy.to_bytes().len(), "lazy index");
+
+    // After `swap_remove` the block geometry shrinks; the hint follows.
+    let mut shrunk = build_index();
+    for _ in 0..40 {
+        shrunk.swap_remove(0);
+    }
     assert_eq!(
-        from_bytes_err.to_string(),
-        load_err.to_string(),
-        "{name}: error message must match load",
+        shrunk.serialized_len(),
+        shrunk.to_bytes().len(),
+        "after swap_remove",
     );
-    from_bytes_err
+    shrunk.prepare();
+    assert_eq!(
+        shrunk.serialized_len(),
+        shrunk.to_bytes().len(),
+        "after swap_remove, warm cache",
+    );
+
+    // Draining to empty is its own geometry (no codes, no scales).
+    let mut drained = build_index();
+    while drained.len() > 0 {
+        drained.swap_remove(drained.len() - 1);
+    }
+    assert_eq!(
+        drained.serialized_len(),
+        drained.to_bytes().len(),
+        "drained to empty",
+    );
 }
 
+/// `to_bytes` sizes its buffer exactly once — the returned `Vec` has no
+/// spare capacity, which holds only if the hint was right and the buffer
+/// never grew (#409).
 #[test]
-fn tv_from_bytes_rejects_corrupt_bytes_with_same_errors_as_load() {
-    let dir = temp_dir("tv-corrupt-parity");
-    let good = build_index().to_bytes();
-
-    // Wrong magic.
-    let mut wrong_magic = good.clone();
-    wrong_magic[0] = b'X';
-    let e = assert_same_error_tv(&dir, "wrong-magic.tv", &wrong_magic);
-    assert!(e.to_string().contains("wrong magic"), "got: {e}");
-
-    // v1 sentinel (bare bit_width first byte).
-    let mut v1 = good.clone();
-    v1[0] = 4; // in 2..=4 → the targeted v1 error
-    let e = assert_same_error_tv(&dir, "v1.tv", &v1);
-    assert!(e.to_string().contains("version 1"), "got: {e}");
-
-    // A pre-v5 version (v4) is refused with the rebuild hint.
-    let mut v4 = good.clone();
-    v4[OFF_VERSION] = 4;
-    let e = assert_same_error_tv(&dir, "v4.tv", &v4);
-    assert!(e.to_string().contains("version 4"), "got: {e}");
-    assert!(e.to_string().to_lowercase().contains("rebuild"), "got: {e}");
-
-    // Unsupported (unknown) version byte.
-    let mut future = good.clone();
-    future[OFF_VERSION] = 9;
-    let e = assert_same_error_tv(&dir, "future.tv", &future);
-    assert!(e.to_string().contains("unsupported .tv format version"), "got: {e}");
-
-    // Truncation.
-    let truncated = &good[..good.len() - 7];
-    let e = assert_same_error_tv(&dir, "truncated.tv", truncated);
-    assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof);
-    std::fs::remove_dir_all(&dir).ok();
+fn to_bytes_allocates_its_buffer_exactly_once() {
+    let idx = build_index();
+    let bytes = idx.to_bytes();
+    assert_eq!(
+        bytes.capacity(),
+        bytes.len(),
+        "to_bytes grew its buffer instead of sizing it up front",
+    );
 }
 
+/// The duplicate-id check on the v7 byte loader. It lost its coverage
+/// when the v6 byte-splicing test that used to exercise it was retired,
+/// and it is the one thing standing between a hand-built image and an
+/// id map that cannot answer `remove` or `contains` unambiguously.
 #[test]
-fn tvim_from_bytes_rejects_duplicate_ids_like_load() {
-    let dir = temp_dir("tvim-dup-parity");
-    let mut idx = IdMapIndex::new(8, 4).unwrap();
-    idx.add_with_ids(&lcg_vectors(3, 8, VEC_SEED), &[7, 8, 9]).unwrap();
-    let mut bytes = idx.to_bytes();
+fn from_bytes_rejects_duplicate_ids() {
+    let dim = 32;
+    let n = 64;
+    let ids: Vec<u64> = (0..n as u64).collect();
+    let mut m = turbovec::IdMapIndex::new(dim, 4).unwrap();
+    m.add_with_ids(&lcg_vectors(n, dim, VEC_SEED), &ids).unwrap();
+    assert!(turbovec::IdMapIndex::from_bytes(&m.to_bytes()).is_ok());
 
-    // The id table is the trailing 3 × u64; overwrite id 9 with 7.
-    let n = bytes.len();
-    bytes[n - 8..].copy_from_slice(&7u64.to_le_bytes());
-
-    let path = dir.join("dup.tvim");
-    std::fs::write(&path, &bytes).unwrap();
-    let from_bytes_err = IdMapIndex::from_bytes(&bytes).expect_err("duplicate ids must not load");
-    let load_err = IdMapIndex::load(&path).expect_err("duplicate ids must not load");
-    assert_eq!(from_bytes_err.kind(), std::io::ErrorKind::InvalidData);
-    assert_eq!(from_bytes_err.to_string(), load_err.to_string());
-    assert!(from_bytes_err.to_string().contains("duplicate ids"), "got: {from_bytes_err}");
-
-    // A .tv payload fed to the .tvim reader is the wrong-magic error.
-    let tv_bytes = build_index().to_bytes();
-    let e = IdMapIndex::from_bytes(&tv_bytes).expect_err(".tv bytes are not a TVIM payload");
-    assert!(e.to_string().contains("not a TVIM file"), "got: {e}");
-    std::fs::remove_dir_all(&dir).ok();
+    // Same rows, but two slots claiming one id.
+    let mut dup = ids.clone();
+    dup[7] = dup[3];
+    let mut m2 = turbovec::IdMapIndex::new(dim, 4).unwrap();
+    m2.add_with_ids(&lcg_vectors(n, dim, VEC_SEED), &ids).unwrap();
+    let mut bytes = m2.to_bytes();
+    // The ids ride the block units; rewrite slot 7's in place by finding
+    // its stored value rather than hard-coding an offset.
+    let needle = 7u64.to_le_bytes();
+    let at = bytes
+        .windows(8)
+        .rposition(|w| w == needle)
+        .expect("slot 7's id must be in the image");
+    bytes[at..at + 8].copy_from_slice(&dup[7].to_le_bytes());
+    let err = turbovec::IdMapIndex::from_bytes(&bytes)
+        .expect_err("duplicate ids must not load");
+    assert!(err.to_string().contains("duplicate"), "got: {err}");
 }

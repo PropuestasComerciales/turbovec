@@ -14,7 +14,7 @@ Covered here:
   embedders; fixed under cosine, pinned old-way under dot_product);
 - reference-parity of cosine-mode ranking on non-unit embeddings;
 - legacy stores written before the format v5 rotation break are refused
-  on load with an actionable rebuild error rather than silently
+  on load with an actionable error rather than silently
   mis-scoring (the pre-v5 `index.tvim` fixtures under
   tests/fixtures/legacy_pre_similarity can no longer be decoded, #206);
 - mode round-trip through save/load and mode-conflict handling;
@@ -200,7 +200,7 @@ def test_langchain_legacy_sidecar_is_refused_after_v5_rotation_break():
     # rotation. After the format v5 hard break (#206) it can no longer be
     # loaded — the quantized codes would decode against a different
     # rotation and silently return near-zero recall — so the store load
-    # must fail loudly with a rebuild hint. The original scores are
+    # must fail loudly, naming the version. The original scores are
     # unrecoverable (the index is lossily quantized), so the legacy-score
     # parity assertion is retired in favour of the rejection contract.
     pytest.importorskip("langchain_core")
@@ -217,7 +217,9 @@ def test_langchain_legacy_sidecar_is_refused_after_v5_rotation_break():
 
     with pytest.raises(Exception) as ei:
         TurboQuantVectorStore.load(FIXTURES / "langchain", embedding=E())
-    assert "rebuild" in str(ei.value).lower()
+    # v7-only: a pre-v7 fixture is refused and pointed at conversion.
+    # v7-only: a pre-v7 file is named and pointed at re-saving or rebuilding.
+    assert "version" in str(ei.value).lower()
 
 
 def test_langchain_zero_vectors_score_zero_under_cosine():
@@ -327,6 +329,9 @@ def test_llama_dot_product_mode_passes_raw_inner_products():
     store = TurboQuantVectorStore(similarity="dot_product")
     store.add(_li_nodes(docs))
     res = store.query(_li_query(query, 3))
+    # Length first: zip() truncates to the shortest input, so a short
+    # (or empty) `similarities` would check nothing.
+    assert len(res.similarities) == 3
     raw = [c * m for c, m in zip(POS_COS, POS_MAGS)]  # 380 / 50 / 4
     # Quantization noise on the raw inner product scales with the
     # document magnitude (~2% of ||v|| at 4 bits), so tolerate that.
@@ -391,7 +396,9 @@ def test_llama_legacy_sidecar_is_refused_after_v5_rotation_break():
         TurboQuantVectorStore.from_persist_path(
             str(FIXTURES / "llama_index" / "store.json")
         )
-    assert "rebuild" in str(ei.value).lower()
+    # v7-only: a pre-v7 fixture is refused and pointed at conversion.
+    # v7-only: a pre-v7 file is named and pointed at re-saving or rebuilding.
+    assert "version" in str(ei.value).lower()
 
 
 def test_llama_zero_vectors_score_zero_under_cosine():
@@ -539,7 +546,9 @@ def test_haystack_legacy_sidecar_is_refused_after_v5_rotation_break():
 
     with pytest.raises(Exception) as ei:
         TurboQuantDocumentStore.load_from_disk(FIXTURES / "haystack")
-    assert "rebuild" in str(ei.value).lower()
+    # v7-only: a pre-v7 fixture is refused and pointed at conversion.
+    # v7-only: a pre-v7 file is named and pointed at re-saving or rebuilding.
+    assert "version" in str(ei.value).lower()
 
 
 def test_haystack_zero_vectors_score_zero_under_cosine():
@@ -612,14 +621,29 @@ def test_agno_similarity_threshold_meaningful_under_cosine_default():
     assert got == ["doc0"]  # relevances ~0.975 / 0.75 / 0.55
 
 
-def test_agno_similarity_threshold_keeps_best_negatives_under_cosine():
-    # All-negative cosines map to small-but-distinct relevances
-    # (0.4 / 0.2 / 0.01): a small threshold keeps the two best matches
-    # instead of discarding everything.
+def test_agno_similarity_threshold_discards_negatives_under_cosine():
+    # agno defines the cosine score as the raw cosine — `normalize_cosine`
+    # is `max(0, min(1, 1 - distance))` — so every negative cosine scores
+    # 0 and any positive threshold rejects it. pgvector, the only other
+    # agno store implementing this knob, enforces the same `cos >= t`.
+    #
+    # This used to keep doc0 and doc1, because the score was mapped
+    # through the inner-product formula `(cos + 1) / 2`, which lifts
+    # -0.2 and -0.6 to 0.4 and 0.2 and puts them over a 0.05 threshold.
+    # That admitted documents agno's contract rejects (#503).
     docs, query = directed_docs(NEG_COS, NEG_MAGS)
     db = _agno_db(docs, query, similarity_threshold=0.05)
-    got = [d.content for d in db.search("the query", limit=3)]
-    assert got == ["doc0", "doc1"]
+    assert [d.content for d in db.search("the query", limit=3)] == []
+
+    # With no threshold the same negatives are still returned and still
+    # ranked best-first — the mapping changes what the threshold means,
+    # not the ordering.
+    db_all = _agno_db(docs, query)
+    assert [d.content for d in db_all.search("the query", limit=3)] == [
+        "doc0",
+        "doc1",
+        "doc2",
+    ]
 
 
 def test_agno_similarity_threshold_inert_under_dot_product():
@@ -733,7 +757,9 @@ def test_agno_legacy_sidecar_is_refused_after_v5_rotation_break():
     db = TurboQuantVectorDb(embedder=E(), path=str(FIXTURES / "agno"))
     with pytest.raises(Exception) as ei:
         db.create()
-    assert "rebuild" in str(ei.value).lower()
+    # v7-only: a pre-v7 fixture is refused and pointed at conversion.
+    # v7-only: a pre-v7 file is named and pointed at re-saving or rebuilding.
+    assert "version" in str(ei.value).lower()
 
 
 def test_agno_zero_vectors_score_zero_under_cosine():
@@ -741,12 +767,15 @@ def test_agno_zero_vectors_score_zero_under_cosine():
     docs, query = directed_docs([0.5], [3.0])
     all_docs = np.vstack([docs, np.zeros((1, DIM), dtype=np.float32)])
     db = _agno_db(all_docs, query)
-    # No threshold: both docs come back; the zero vector ranks last with
-    # scaled similarity (0 + 1) / 2 = 0.5 — i.e. raw score 0. Verify via
-    # a threshold sitting between the two.
+    # No threshold: both docs come back, the zero vector ranking last on
+    # a raw score of 0.
     got = [d.content for d in db.search("the query", limit=2)]
     assert got == ["doc0", "doc1"]
-    db2 = _agno_db(all_docs, query, similarity_threshold=0.6)
+    # Under cosine the score *is* the raw cosine, so the zero vector
+    # scores 0 and any positive threshold drops it. (It scored 0.5 when
+    # the mapping was `(0 + 1) / 2`, so this needed a threshold above 0.5
+    # to discriminate — see #503.)
+    db2 = _agno_db(all_docs, query, similarity_threshold=0.1)
     assert [d.content for d in db2.search("the query", limit=2)] == ["doc0"]
 
 
@@ -764,3 +793,46 @@ def test_agno_rejects_l2_distance():
 
     with pytest.raises(ValueError, match="distance"):
         TurboQuantVectorDb(embedder=E(), distance=Distance.l2)
+
+
+def test_langchain_dot_product_relevance_is_unclamped_and_warns():
+    # Issue #322: the relevance clamp mapped every raw inner product
+    # >= 1.0 onto exactly 1.0, so a score_threshold retriever admitted
+    # unrelated documents and LangChain's own out-of-range warning never
+    # fired. In dot_product mode the mapping is now unclamped, and asking
+    # for a relevance fn warns that the mode has no calibrated [0, 1]
+    # relevance.
+    docs, query = directed_docs(POS_COS, POS_MAGS)
+    store = _lc_store(docs, query, similarity="dot_product")
+
+    with pytest.warns(UserWarning, match="dot_product"):
+        fn = store._select_relevance_score_fn()
+    # Raw inner products well above 1 no longer saturate.
+    assert fn(24.91) > 1.0
+    assert fn(2.42) > 1.0
+    assert fn(24.91) > fn(2.42)
+
+    # The retriever repro: with the clamp, both d0 and d1 scored exactly
+    # 1.0 and passed a 0.99 threshold. Unclamped they stay distinct, and
+    # LangChain's base class surfaces the out-of-range scores itself.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        pairs = store.similarity_search_with_relevance_scores("q", k=3)
+    scores = [s for _, s in pairs]
+    assert scores[0] > scores[1] > scores[2]
+    assert len(set(scores)) == len(scores)
+    assert any("0 and 1" in str(w.message) for w in caught), [
+        str(w.message) for w in caught
+    ]
+
+
+def test_langchain_cosine_relevance_stays_clamped_and_silent():
+    # The default mode is unaffected by the #322 change: still clamped,
+    # still no warning.
+    docs, query = directed_docs(POS_COS, POS_MAGS)
+    store = _lc_store(docs, query)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        fn = store._select_relevance_score_fn()
+    assert fn(1.0001) == 1.0
+    assert fn(-1.0001) == 0.0

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/header.png" alt="turbovec — Google's TurboQuant for vector search" width="100%">
+  <img src="https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/header.png" alt="turbovec — Google's TurboQuant for vector search" width="100%">
 </p>
 
 <p align="center">
@@ -16,7 +16,8 @@
 turbovec is a Rust vector index with Python bindings, built on Google Research's [**TurboQuant**](https://arxiv.org/abs/2504.19874) algorithm — a data-oblivious quantizer with near-optimal distortion and no separate training phase.
 
 - **Online ingest.** Add vectors, they're indexed — no train step, no parameter tuning, no rebuilds as the corpus grows.
-- **Fast SIMD search.** Hand-written NEON (ARM) and AVX-512BW (x86) kernels beat FAISS IndexPQFastScan by 10–19% on ARM; on x86 they win the 4-bit configs and trail by a few percent on 2-bit.
+- **Fast SIMD search.** Hand-written kernels — NEON SDOT/SMMLA on ARM, AVX-512 VNNI and `vpermb` on x86, with AVX2 and scalar fallbacks — beat FAISS IndexPQFastScan in every measured config, averaging 3.4× at 4-bit and 23% at 2-bit across the eight cells of each width, on both architectures.
+- **Incremental saves.** `sync(path)` persists just what changed since the last sync — one fsync per call, crash-safe at any byte, and a removal or a small append costs milliseconds however large the index. `write`/`load` stay for whole-file snapshots.
 - **Filter at search time.** Pass an id allowlist (or a slot bitmask) to `search()` and the kernel honours it directly. You always get up to `k` results from the allowed set — no over-fetching, no recall hit on selective filters.
 - **Pure local.** No managed service, no data leaving your machine or VPC. Pair with any open-source embedding model for a fully air-gapped RAG stack.
 
@@ -39,6 +40,8 @@ scores, indices = index.search(query, k=10)
 
 index.write("my_index.tv")
 loaded = TurboQuantIndex.load("my_index.tv")
+
+index.sync("my_index.tv")   # after more changes: durable incremental save
 ```
 
 `vectors` and `query` are 2-D `float32` arrays of shape `(n, dim)` — other dtypes are rejected rather than silently converted, so cast with `np.asarray(x, dtype=np.float32)` first if needed.
@@ -57,6 +60,8 @@ index.remove(1002)                         # O(1) by id
 
 index.write("my_index.tvim")
 loaded = IdMapIndex.load("my_index.tvim")
+
+index.sync("my_index.tvim")   # durable incremental save, ids included
 ```
 
 ### Hybrid retrieval (filtered search)
@@ -80,18 +85,18 @@ scores, ids = idx.search(query, k=10, allowlist=allowed)
 
 Filtering happens inside the SIMD kernel at 32-vector block granularity: blocks with no allowed slots are short-circuited before any LUT lookup or scoring work, and individual non-allowed slots inside scored blocks are dropped at heap-insert. Selective allowlists (small fraction of the index allowed) therefore avoid most of the SIMD cost rather than paying it and discarding the result afterwards.
 
-The output length is `min(k, len(allowed))` — when the allowlist is smaller than `k` you get exactly `len(allowed)` results rather than padded fallbacks.
+The output length is `min(k, n_allowed)`, where `n_allowed` counts *distinct* allowed vectors — when fewer vectors are allowed than `k` you get exactly that many results rather than padded fallbacks.
 
-See [`docs/api.md`](docs/api.md) for the full reference.
+See [`docs/api.md`](https://github.com/RyanCodrai/turbovec/blob/main/docs/api.md) for the full reference.
 
 ### Framework integrations
 
 Drop-in replacements for the in-tree reference vector / document stores in each framework. Same public surface, same persistence semantics, same retriever and pipeline wiring — swap the import and keep your pipeline.
 
-- [LangChain](docs/integrations/langchain.md) — `pip install turbovec[langchain]` · replaces `langchain_core.vectorstores.InMemoryVectorStore`
-- [LlamaIndex](docs/integrations/llama_index.md) — `pip install turbovec[llama-index]` · replaces `llama_index.core.vector_stores.SimpleVectorStore`
-- [Haystack](docs/integrations/haystack.md) — `pip install turbovec[haystack]` · replaces `haystack.document_stores.in_memory.InMemoryDocumentStore`
-- [Agno](docs/integrations/agno.md) — `pip install turbovec[agno]` · replaces `agno.vectordb.lancedb.LanceDb`
+- [LangChain](https://github.com/RyanCodrai/turbovec/blob/main/docs/integrations/langchain.md) — `pip install turbovec[langchain]` · replaces `langchain_core.vectorstores.InMemoryVectorStore`
+- [LlamaIndex](https://github.com/RyanCodrai/turbovec/blob/main/docs/integrations/llama_index.md) — `pip install turbovec[llama-index]` · replaces `llama_index.core.vector_stores.SimpleVectorStore`
+- [Haystack](https://github.com/RyanCodrai/turbovec/blob/main/docs/integrations/haystack.md) — `pip install turbovec[haystack]` · replaces `haystack.document_stores.in_memory.InMemoryDocumentStore`
+- [Agno](https://github.com/RyanCodrai/turbovec/blob/main/docs/integrations/agno.md) — `pip install turbovec[agno]` · replaces `agno.vectordb.lancedb.LanceDb`
 
 ## Rust
 
@@ -126,65 +131,81 @@ let loaded = IdMapIndex::load("index.tvim").unwrap();
 
 TurboQuant vs FAISS `IndexPQ` (LUT256, nbits=8) — the paper's Section 4.4 baseline. 100K vectors, k=64. FAISS PQ sub-quantizer counts sized to match TurboQuant's bit rate (m=d/4 at 2-bit, m=d/2 at 4-bit).
 
-![Recall GloVe d=200](docs/recall_glove.svg)
+![Recall GloVe d=200](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/recall_glove.svg)
 
-![Recall d=1536](docs/recall_d1536.svg)
+![Recall d=1536](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/recall_d1536.svg)
 
-![Recall d=3072](docs/recall_d3072.svg)
+![Recall d=3072](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/recall_d3072.svg)
 
-Across OpenAI d=1536 and d=3072, TurboQuant beats FAISS by 0.2–1.9 points at R@1 across 2-bit and 4-bit, and both reach 1.0 by k=8 (≥0.997 already at k=4). GloVe d=200 is the harder regime — at low dim the asymptotic Beta assumption is looser. TurboQuant beats FAISS by 0.9 points at 4-bit and is effectively tied at 2-bit (within 0.1 points) at R@1, both tracking FAISS closely by k≈16.
+The charts plot calibrated TurboQuant (TQ+). Across OpenAI d=1536 and d=3072, TQ+ beats FAISS at R@1 on three of four cells (by 0.9–2.9 points; d=1536 4-bit trails by 0.7), and both reach 1.0 by k=8 (≥0.997 already at k≤4). GloVe d=200 is the harder regime — at low dim the asymptotic Beta assumption is looser. TQ+ lands ahead of FAISS at R@1 at both bit widths (+1.9 at 4-bit, +0.8 at 2-bit), with FAISS keeping a slim edge at 2-bit from k≈8. Uncalibrated numbers are in the JSONs (`tq_recalls`).
 
-**A note on baselines.** We compare against FAISS `IndexPQ` (LUT256, nbits=8, float32 LUT) because it's the default production-grade PQ most users would reach for. This is a stronger baseline than the custom u8-LUT PQ in the [TurboQuant paper](https://arxiv.org/abs/2504.19874) — FAISS uses a higher-precision LUT at scoring time and k-means++ for codebook training. We reproduce the paper's TurboQuant numbers on OpenAI d=1536 / d=3072 and hit similar numbers to other community reference implementations on low-dim embeddings (see [`turboquant-py`](https://pypi.org/project/turboquant-py/) at d=384). On GloVe (d=200) — the low-dim regime where the asymptotic Beta assumption is loosest — TurboQuant lands level with FAISS at 2-bit and ahead at 4-bit; TQ+ calibration closes the low-dim gap the base algorithm leaves.
+**A note on baselines.** We compare against FAISS `IndexPQ` (LUT256, nbits=8, float32 LUT) because it's the default production-grade PQ most users would reach for. This is a stronger baseline than the custom u8-LUT PQ in the [TurboQuant paper](https://arxiv.org/abs/2504.19874) — FAISS uses a higher-precision LUT at scoring time and k-means++ for codebook training. We reproduce the paper's TurboQuant numbers on OpenAI d=1536 / d=3072 and hit similar numbers to other community reference implementations on low-dim embeddings (see [`turboquant-py`](https://pypi.org/project/turboquant-py/) at d=384). On GloVe (d=200) — the low-dim regime where the asymptotic Beta assumption is loosest — TurboQuant lands ahead of FAISS at 4-bit but trails it at 2-bit; TQ+ calibration recovers the 2-bit deficit at R@1 (0.572 vs FAISS's 0.564), with FAISS keeping a slim edge at deeper k.
 
-Full results: [d=1536 2-bit](benchmarks/results/recall_d1536_2bit.json), [d=1536 4-bit](benchmarks/results/recall_d1536_4bit.json), [d=3072 2-bit](benchmarks/results/recall_d3072_2bit.json), [d=3072 4-bit](benchmarks/results/recall_d3072_4bit.json), [GloVe 2-bit](benchmarks/results/recall_glove_2bit.json), [GloVe 4-bit](benchmarks/results/recall_glove_4bit.json).
+Full results: [d=1536 2-bit](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/recall_d1536_2bit.json), [d=1536 4-bit](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/recall_d1536_4bit.json), [d=3072 2-bit](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/recall_d3072_2bit.json), [d=3072 4-bit](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/recall_d3072_4bit.json), [GloVe 2-bit](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/recall_glove_2bit.json), [GloVe 4-bit](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/recall_glove_4bit.json).
 
 ## Compression
 
-![Compression](docs/compression.svg)
+![Compression](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/compression.svg)
 
 ## Search Speed
 
 All benchmarks: 100K vectors, 1K queries, k=64, median of 5 runs.
 
-### ARM (Apple M3 Max)
+### ARM (GCP c4a-standard-8, Google Axion, 8 vCPUs)
 
-![ARM Speed — Single-threaded](docs/arm_speed_st.svg)
+![ARM Speed — Single-threaded](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/arm_speed_st.svg)
 
-![ARM Speed — Multi-threaded](docs/arm_speed_mt.svg)
+![ARM Speed — Multi-threaded](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/arm_speed_mt.svg)
 
-On ARM, TurboQuant beats FAISS FastScan by 10–19% across every config.
-
-### x86 (Intel Xeon Platinum 8481C / Sapphire Rapids, 8 vCPUs)
-
-![x86 Speed — Single-threaded](docs/x86_speed_st.svg)
-
-![x86 Speed — Multi-threaded](docs/x86_speed_mt.svg)
-
-On x86, TurboQuant wins the 4-bit configs by up to ~5% (d=3072 multi-threaded ties) and is modestly behind FAISS on 2-bit — most visibly d=1536 single-threaded (~8%), within a few percent on the rest — where FAISS's AVX-512 VBMI path has the edge on the short 2-bit accumulate loop.
-
-## Insertion & Removal Speed
-
-Same corpus as the search cells: 100K OpenAI vectors, median of 5 runs, fresh index per timed run. Insertion measures bulk `add()` into an empty index (one-time rotation/codebook init and TQ+ calibration fit included) and a warm 10K append with calibration frozen (the steady-state encode path), against FAISS `IndexPQFastScan` bulk add (training untimed). Removal measures per-op latency of `IdMapIndex.remove(id)` against raw `TurboQuantIndex.swap_remove` — both O(1) swap-and-pop; the gap is the id-map bookkeeping. Single-threaded cells pin `RAYON_NUM_THREADS=1`. Scripts: [`benchmarks/suite/`](benchmarks/suite/).
-
-### ARM (Apple M3 Max)
-
-![ARM Insertion — Single-threaded](docs/arm_insert_st.svg)
-
-![ARM Insertion — Multi-threaded](docs/arm_insert_mt.svg)
-
-![ARM Removal — Single-threaded](docs/arm_remove_st.svg)
-
-Full results: [d=1536 2-bit insert ST](benchmarks/results/speed_insert_d1536_2bit_arm_st.json), [MT](benchmarks/results/speed_insert_d1536_2bit_arm_mt.json), [d=1536 4-bit insert ST](benchmarks/results/speed_insert_d1536_4bit_arm_st.json), [MT](benchmarks/results/speed_insert_d1536_4bit_arm_mt.json), [d=3072 2-bit insert ST](benchmarks/results/speed_insert_d3072_2bit_arm_st.json), [MT](benchmarks/results/speed_insert_d3072_2bit_arm_mt.json), [d=3072 4-bit insert ST](benchmarks/results/speed_insert_d3072_4bit_arm_st.json), [MT](benchmarks/results/speed_insert_d3072_4bit_arm_mt.json), and the matching [`speed_remove_*`](benchmarks/results/) files.
+On ARM, TurboQuant beats FAISS FastScan in every config, averaging 3.5× at 4-bit (3.4–3.7× across cells — the SDOT/SMMLA dot-product kernels score the vector-major layout directly) and 26% at 2-bit (22–29%).
 
 ### x86 (Intel Xeon Platinum 8481C / Sapphire Rapids, 8 vCPUs)
 
-![x86 Insertion — Single-threaded](docs/x86_insert_st.svg)
+![x86 Speed — Single-threaded](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/x86_speed_st.svg)
 
-![x86 Insertion — Multi-threaded](docs/x86_insert_mt.svg)
+![x86 Speed — Multi-threaded](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/x86_speed_mt.svg)
 
-![x86 Removal — Single-threaded](docs/x86_remove_st.svg)
+On x86, TurboQuant wins every config, averaging 3.4× at 4-bit (3.2–3.5× across cells — the AVX-512 VNNI dot-product kernel on the vector-major layout) and 20% at 2-bit (5–32%), where the `vpermb` LUT scan carries the short 2-bit accumulate loop.
 
-Full results: [d=1536 2-bit insert ST](benchmarks/results/speed_insert_d1536_2bit_x86_st.json), [MT](benchmarks/results/speed_insert_d1536_2bit_x86_mt.json), [d=1536 4-bit insert ST](benchmarks/results/speed_insert_d1536_4bit_x86_st.json), [MT](benchmarks/results/speed_insert_d1536_4bit_x86_mt.json), [d=3072 2-bit insert ST](benchmarks/results/speed_insert_d3072_2bit_x86_st.json), [MT](benchmarks/results/speed_insert_d3072_2bit_x86_mt.json), [d=3072 4-bit insert ST](benchmarks/results/speed_insert_d3072_4bit_x86_st.json), [MT](benchmarks/results/speed_insert_d3072_4bit_x86_mt.json), and the matching [`speed_remove_*`](benchmarks/results/) files.
+## Insertion & Removal Latency
+
+Same corpus as the search cells: 100K OpenAI vectors, median of 5 runs, timed loops including the Python-call overhead a caller actually pays per op. Insertion measures per-vector `add()` latency on a warm, populated index (built untimed) at n=1 — a single-vector `add()` — and n=100 — a 100-vector batch, showing how far batching amortizes the per-call overhead — against `add()` into the trained, populated FAISS `IndexPQFastScan` (training untimed). A single `add()` lands in 6.3–19.7 µs depending on the cell (7.6–13.9× faster than a FAISS single add), and a 100-vector batch amortizes TurboQuant to 4.6–16.3 µs/vector (4.6–15.1× faster than the same batch into FAISS). Removal measures per-op remove-by-id latency at n=1 (the steady per-op rate over 1000 removes) and n=100 (the first 100 removes on a fresh index): `IdMapIndex.remove(id)` — O(1) swap-and-pop plus the id-map bookkeeping — lands at 0.44–1.22 µs and 0.59–1.37 µs per op across the cells. The FAISS column is the same user-visible operation, `remove_ids` on an `IndexIDMap` over `IndexPQFastScan`, which repacks the stored codes on every call: 0.19–1.02 s per single remove at 100K, with cost doubling alongside code size — which is why the removal charts use a log-scale axis. Charts show the single-threaded cells (`RAYON_NUM_THREADS=1`); the `_mt` cells are measured too and match at n=1, since a single add is serial. Scripts: [`benchmarks/suite/`](https://github.com/RyanCodrai/turbovec/tree/main/benchmarks/suite/).
+
+### ARM (GCP c4a-standard-8, Google Axion, 8 vCPUs)
+
+![ARM Online Insert Latency — Single-threaded](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/arm_insert_online_st.svg)
+
+![ARM Online Remove Latency — Single-threaded](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/arm_remove_online_st.svg)
+
+Full results: [d=1536 2-bit insert](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_insert_d1536_2bit_arm_st.json), [d=1536 4-bit insert](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_insert_d1536_4bit_arm_st.json), [d=3072 2-bit insert](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_insert_d3072_2bit_arm_st.json), [d=3072 4-bit insert](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_insert_d3072_4bit_arm_st.json), and the matching [`speed_remove_*`](https://github.com/RyanCodrai/turbovec/tree/main/benchmarks/results/) and `_mt` files.
+
+### x86 (Intel Xeon Platinum 8481C / Sapphire Rapids, 8 vCPUs)
+
+![x86 Online Insert Latency — Single-threaded](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/x86_insert_online_st.svg)
+
+![x86 Online Remove Latency — Single-threaded](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/x86_remove_online_st.svg)
+
+Full results: [d=1536 2-bit insert](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_insert_d1536_2bit_x86_st.json), [d=1536 4-bit insert](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_insert_d1536_4bit_x86_st.json), [d=3072 2-bit insert](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_insert_d3072_2bit_x86_st.json), [d=3072 4-bit insert](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_insert_d3072_4bit_x86_st.json), and the matching [`speed_remove_*`](https://github.com/RyanCodrai/turbovec/tree/main/benchmarks/results/) and `_mt` files.
+
+## Save & Load
+
+Same corpus as the search cells: 100K OpenAI vectors, median of 5 runs. TurboQuant serializes to a single `.tv` file with an fsync + atomic rename; FAISS is `write_index` / `read_index` on the precision-matched `IndexPQFastScan` (sub-quantizer count matched to TurboQuant's bit rate, as in the search cells). **Save (warm)** is a write after a search has run, so the blocked layout cache is populated. **Load → first search** opens a fresh index and times the first query — separating bare deserialization (the page cache is warm throughout, so this is layout work, not cold-storage I/O) from the first-query cost. **Round-trip** chains the checkpoint/resume cycle an embedding store actually pays — mutate 1K vectors → save → reopen → serve the first query; FAISS has no measured equivalent for this path, so it is shown for TurboQuant only. On the smaller payloads the round-trip can come in *below* the isolated post-mutation ("dirty") write: the two are timed in separate suite steps, and at small file sizes the standalone `fsync` in the dirty-write step dominates and inflates it — a measurement artifact of the harness, not a repack win in the combined path. Single-threaded cells pin `RAYON_NUM_THREADS=1`. Scripts: [`benchmarks/suite/`](https://github.com/RyanCodrai/turbovec/tree/main/benchmarks/suite/).
+
+### ARM (GCP c4a-standard-8, Google Axion, 8 vCPUs)
+
+![ARM Save/Load — Single-threaded](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/arm_persist_st.svg)
+
+![ARM Save/Load — Multi-threaded](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/arm_persist_mt.svg)
+
+Full results: [d=1536 2-bit persist ST](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_persist_d1536_2bit_arm_st.json), [MT](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_persist_d1536_2bit_arm_mt.json), [d=1536 4-bit persist ST](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_persist_d1536_4bit_arm_st.json), [MT](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_persist_d1536_4bit_arm_mt.json), [d=3072 2-bit persist ST](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_persist_d3072_2bit_arm_st.json), [MT](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_persist_d3072_2bit_arm_mt.json), [d=3072 4-bit persist ST](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_persist_d3072_4bit_arm_st.json), [MT](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_persist_d3072_4bit_arm_mt.json).
+
+### x86 (Intel Xeon Platinum 8481C / Sapphire Rapids, 8 vCPUs)
+
+![x86 Save/Load — Single-threaded](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/x86_persist_st.svg)
+
+![x86 Save/Load — Multi-threaded](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/x86_persist_mt.svg)
+
+Full results: [d=1536 2-bit persist ST](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_persist_d1536_2bit_x86_st.json), [MT](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_persist_d1536_2bit_x86_mt.json), [d=1536 4-bit persist ST](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_persist_d1536_4bit_x86_st.json), [MT](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_persist_d1536_4bit_x86_mt.json), [d=3072 2-bit persist ST](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_persist_d3072_2bit_x86_st.json), [MT](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_persist_d3072_2bit_x86_mt.json), [d=3072 4-bit persist ST](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_persist_d3072_4bit_x86_st.json), [MT](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_persist_d3072_4bit_x86_mt.json).
 
 ## How it works
 
@@ -194,7 +215,7 @@ Each vector is a direction on a high-dimensional hypersphere. TurboQuant compres
 
 **2. Random rotation.** Multiply all vectors by the same random orthogonal matrix. After rotation, each coordinate independently follows a Beta distribution that converges to Gaussian N(0, 1/d) in high dimensions. This holds for any input data -- the rotation makes the coordinate distribution predictable.
 
-**3. Per-coordinate calibration (TQ+).** The Beta distribution from step 2 is asymptotic — at finite dimensions, individual coordinates drift from the canonical shape (especially low-bit and word-vector-style embeddings). TQ+ fits two scalars per coordinate — a shift and a scale — during the first add, mapping each coordinate's empirical 5/95% quantiles onto the canonical Beta marginal. The Lloyd-Max codebook then quantizes against the *target* distribution it was designed for. The calibration is frozen after the first add and reused by subsequent adds — no retraining, no rebuilds, no separate train phase. Recall gain: up to +1.4pp at @1 on the cells that drift most (e.g. GloVe at 2-bit).
+**3. Per-coordinate calibration (TQ+).** The Beta distribution from step 2 is asymptotic — at finite dimensions, individual coordinates drift from the canonical shape (especially low-bit and word-vector-style embeddings). TQ+ fits two scalars per coordinate — a shift and a scale — mapping each coordinate's empirical quantiles onto the codebook's outermost centroids. The probability level comes from the codebook, so it tracks the bit width (~0.933 at 2-bit, ~0.996 at 4-bit) rather than being fixed. The Lloyd-Max codebook then quantizes against the *target* distribution it was designed for. The fit is explicit: call `index.calibrate(sample)` once with a random, representative sample of your vectors (~1024 rows is enough — a draw of that size matches fitting on the whole corpus) before adding; afterwards the calibration is committed and reused by every add — no retraining, no rebuilds, no separate train phase. An index you never calibrate is plain TurboQuant. `index.calibration_state` reports `"uncalibrated"` or `"calibrated"`. Recall gain: up to +2.2pp at @1 on the cells that drift most (e.g. GloVe at 2-bit).
 
 **4. Lloyd-Max scalar quantization.** Since the distribution is known, we can precompute the optimal way to bucket each coordinate. For 2-bit, that's 4 buckets; for 4-bit, 16 buckets. The [Lloyd-Max algorithm](https://en.wikipedia.org/wiki/Lloyd%27s_algorithm) finds bucket boundaries and centroids that minimize mean squared error. These are computed once from the math, not from the data.
 
@@ -256,6 +277,26 @@ Results are saved as JSON to `benchmarks/results/`. Regenerate charts:
 ```bash
 python3 benchmarks/create_diagrams.py
 ```
+
+### Quick harness for optimization work
+
+The suite above is the source of every published number — real embeddings,
+FAISS comparator, fixed shapes, run on the two official environments. For the
+inner loop of an optimization pass there's also a Rust harness that reproduces
+the four mutation metrics (cold bulk add, warm append, single add, remove) on
+deterministic synthetic vectors, so a hypothesis can be measured in seconds on
+any machine with no dataset and no FAISS:
+
+```bash
+cargo run --release --example insert_bench -- --dim 1536 --bits 2
+RAYON_NUM_THREADS=1 cargo run --release --example insert_bench
+```
+
+It is a screening tool, not a source of published numbers.
+
+`examples/encode_hash` prints a per-stage hash of the encode pipeline for a
+fixed input; CI runs it on every OS in the matrix and fails if they disagree,
+which is how cross-platform byte identity of the encode is checked.
 
 ## References
 

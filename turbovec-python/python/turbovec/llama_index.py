@@ -1,10 +1,23 @@
 """LlamaIndex VectorStore backed by turbovec's quantized index.
 
 Install with: ``pip install turbovec[llama-index]``.
+
+Async methods run the index work on a worker thread
+(``asyncio.to_thread``) so the event loop stays responsive while a large
+add or query is in flight (issue #342) — ``BasePydanticVectorStore``'s
+defaults call straight into the sync body, which blocked the loop for the
+operation's full duration. Cancelling the awaiting task returns control
+to the caller immediately, but it does **not** decide the write's fate: a
+worker that already started runs to completion (work inside the Rust core
+is not interruptible), while a call still queued behind a saturated
+executor is cancelled before it ever runs. A cancelled write is therefore
+"outcome unknown" — it may have fully committed, or may never have begun.
+The one guarantee is that it is all-or-nothing: the store is never torn.
 """
 
 from __future__ import annotations
 
+import asyncio
 import copy as _copy
 import json
 import os
@@ -15,7 +28,11 @@ from typing import Any, List, Optional, Sequence
 import numpy as np
 
 from ._dedup import DuplicatePolicy, resolve_duplicates
-from ._persist import check_persisted_handles, check_sidecar_keysets
+from ._persist import (
+    check_persisted_handles,
+    check_schema_version,
+    check_sidecar_keysets,
+)
 from ._similarity import COSINE, DOT_PRODUCT, l2_normalize_rows, validate_similarity
 from ._turbovec import IdMapIndex
 from ._persist import atomic_save  # isort:skip
@@ -81,6 +98,49 @@ _NODES_SCHEMA_COMPAT = (1, 2, 3)
 # which can never equal a real FilterOperator/FilterCondition member.
 _TEXT_MATCH_INSENSITIVE = getattr(FilterOperator, "TEXT_MATCH_INSENSITIVE", None)
 _CONDITION_NOT = getattr(FilterCondition, "NOT", None)
+
+
+def _payload_for(node: BaseNode) -> dict:
+    """The stored record for one node.
+
+    ``metadata`` holds the **JSON-coerced** view, not ``node.metadata``.
+    Filtering reads this field and ``_reconstruct_node`` rebuilds the
+    returned node from ``node_dict``, which is itself
+    ``model_dump(mode="json")`` — so keeping a raw copy here meant the
+    store filtered on values it would never hand back. A tuple filtered
+    as ``(1, 2)`` and returned as ``[1, 2]``; a datetime filtered as a
+    datetime and returned as an ISO string; and because ``persist()``
+    re-coerces through JSON, the same filter changed answers across a
+    save/reload cycle (#497).
+
+    ``SimpleVectorStore`` stores the coerced dict from
+    ``node_to_metadata_dict`` and filters on that same dict, so it is
+    self-consistent and persist-invariant. This matches it.
+    """
+    node_dict = node_to_metadata_dict(node, remove_text=False, flat_metadata=False)
+    # The coerced metadata lives inside the serialized node content; fall
+    # back to the raw mapping if a future llama-index shape omits it,
+    # since a filter on stale-but-present values beats crashing an add.
+    # The returned node is rebuilt from `node_dict` by
+    # `_reconstruct_node`, so the filter view has to come from the same
+    # place or stored and returned diverge — which is the whole point of
+    # #497. That means `_node_content`, not the node's own dump: at the
+    # declared floor the two disagree, and preferring the dump would
+    # reintroduce the divergence in the other direction.
+    coerced = None
+    content = node_dict.get("_node_content")
+    if isinstance(content, str):
+        try:
+            coerced = json.loads(content).get("metadata")
+        except (ValueError, AttributeError):
+            coerced = None
+    if not isinstance(coerced, dict):
+        coerced = dict(node.metadata)
+    return {
+        "metadata": coerced,
+        "ref_doc_id": node.ref_doc_id,
+        "node_dict": node_dict,
+    }
 
 
 def _validate_namespace(namespace: str) -> str:
@@ -324,16 +384,7 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         # start/end_char_idx and mimetype on retrieval. The narrow
         # `{text, metadata, ref_doc_id}` schema we used to keep lost
         # all of those silently.
-        payloads = [
-            {
-                "metadata": dict(node.metadata),
-                "ref_doc_id": node.ref_doc_id,
-                "node_dict": node_to_metadata_dict(
-                    node, remove_text=False, flat_metadata=False
-                ),
-            }
-            for node in nodes
-        ]
+        payloads = [_payload_for(node) for node in nodes]
 
         # Cosine mode: L2-normalize outside the lock (pure computation)
         # so the engine's raw inner product is true cosine similarity.
@@ -407,10 +458,19 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         return ids
 
     def delete(self, ref_doc_id: str, **_: Any) -> None:
-        """Delete every node whose ``ref_doc_id`` matches."""
+        """Delete every node whose ``ref_doc_id`` matches.
+
+        A node with no SOURCE relationship is filed under the literal
+        string ``"None"``, matching the reference (``SimpleVectorStore``
+        stores ``node.ref_doc_id or "None"``). So ``delete(None)`` is a
+        no-op rather than a wipe of every parentless node (issue #302);
+        ``delete("None")`` is the way to target them.
+        """
         with self._write_lock:
             matching = [
-                nid for nid, data in self._nodes.items() if data.get("ref_doc_id") == ref_doc_id
+                nid
+                for nid, data in self._nodes.items()
+                if (data.get("ref_doc_id") or "None") == ref_doc_id
             ]
             for nid in matching:
                 self._remove_node_by_id(nid)
@@ -426,7 +486,22 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         ``node_ids`` is the explicit selection here: an empty list selects
         nothing (a no-op), unlike ``query``'s ``node_ids=[]``, which
         follows the retriever calling convention and restricts nothing.
-        Matches the signature and semantics of ``SimpleVectorStore.delete_nodes``.
+        Takes ``SimpleVectorStore.delete_nodes``'s signature, and its
+        semantics for the selections both accept. Two divergences are
+        deliberate:
+
+        * Both arguments ``None`` is a no-op here. ``SimpleVectorStore``
+          deletes *every* node in that case, because
+          ``build_metadata_filter_fn(None)`` returns an always-true
+          predicate that it applies to all ids. The base
+          ``BasePydanticVectorStore.delete_nodes`` contract does not
+          specify delete-all, and a dedicated ``clear()`` already exists
+          for it, so the no-op is the safer reading rather than an
+          accidental-mass-wipe footgun. Use ``clear()`` to empty the store.
+        * A ``filters`` value containing a nested ``MetadataFilters``
+          group is evaluated here, where the reference raises
+          ``ValueError`` — see ``_filters_match``, which documents that
+          superset.
         """
         if not node_ids and filters is None:
             return
@@ -651,10 +726,11 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         if op == FilterOperator.IS_EMPTY:
             return value is None or value == "" or value == []
 
-        # Missing key: the reference (`build_metadata_filter_fn`,
-        # `utils.py`) treats an absent value as a MATCH for the negative
-        # operators NE / NIN ("not equal to X" is trivially true when the
-        # key isn't there) and a non-match for every other operator.
+        # Missing key: no value to compare, so every operator declines —
+        # EXCEPT the negative ones. "this node's colour is not red" is
+        # vacuously true of a node with no colour, which is what
+        # llama-index-core >= 0.14 does. (Older 0.12.x excluded on NE/NIN;
+        # we track the current reference, since that is what users get.)
         if value is None:
             return op in (FilterOperator.NE, FilterOperator.NIN)
 
@@ -677,11 +753,12 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         if op == FilterOperator.CONTAINS:
             return target in value
         if op == FilterOperator.TEXT_MATCH:
-            # Reference (`utils.py:138-144`): case-SENSITIVE substring,
-            # both sides must be strings. Previous turbovec impl
-            # lowercased both sides — a silent semantic divergence that
-            # caused our results to disagree with SimpleVectorStore on
-            # mixed-case keys.
+            # Case-SENSITIVE substring. `FilterOperator` defines
+            # TEXT_MATCH and TEXT_MATCH_INSENSITIVE as distinct operators,
+            # so folding case here would collapse that distinction and
+            # leave no way to ask for a case-sensitive match. The type
+            # guard is ours: the reference raises AttributeError on a
+            # non-string (issue #302).
             if isinstance(target, str) and isinstance(value, str):
                 return target in value
             raise TypeError(
@@ -830,17 +907,25 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
     # ---- Async overrides --------------------------------------------------
     #
     # The base class provides default async impls that delegate to sync via
-    # `return self.<sync>(...)`. We override them explicitly so the signature
-    # is visible on the class and an autodoc tool / IDE doesn't make
-    # callers chase the abstract base class for the documentation.
+    # `return self.<sync>(...)` — inline on the loop thread, which blocks
+    # it for the operation's whole duration (issue #342). We override
+    # them to run the sync body on a worker
+    # thread instead. One `to_thread` call per method, never one per
+    # chunk: the sync bodies take the write lock, and a suspension point
+    # inside one would break the atomicity the sync path guarantees.
+    #
+    # `asyncio.to_thread` propagates the caller's context vars, and the
+    # index releases the GIL for the heavy work, so the loop really does
+    # keep running. Cancellation frees the *caller*, not the worker — see
+    # the module docstring.
 
     async def async_add(
         self, nodes: Sequence[BaseNode], **kwargs: Any
     ) -> List[str]:
-        return self.add(list(nodes), **kwargs)
+        return await asyncio.to_thread(self.add, list(nodes), **kwargs)
 
     async def adelete(self, ref_doc_id: str, **kwargs: Any) -> None:
-        self.delete(ref_doc_id, **kwargs)
+        await asyncio.to_thread(self.delete, ref_doc_id, **kwargs)
 
     async def adelete_nodes(
         self,
@@ -848,22 +933,26 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         filters: Optional[MetadataFilters] = None,
         **kwargs: Any,
     ) -> None:
-        self.delete_nodes(node_ids=node_ids, filters=filters, **kwargs)
+        await asyncio.to_thread(
+            self.delete_nodes, node_ids=node_ids, filters=filters, **kwargs
+        )
 
     async def aclear(self) -> None:
-        self.clear()
+        await asyncio.to_thread(self.clear)
 
     async def aquery(
         self, query: VectorStoreQuery, **kwargs: Any
     ) -> VectorStoreQueryResult:
-        return self.query(query, **kwargs)
+        return await asyncio.to_thread(self.query, query, **kwargs)
 
     async def aget_nodes(
         self,
         node_ids: Optional[List[str]] = None,
         filters: Optional[MetadataFilters] = None,
     ) -> List[BaseNode]:
-        return self.get_nodes(node_ids=node_ids, filters=filters)
+        return await asyncio.to_thread(
+            self.get_nodes, node_ids=node_ids, filters=filters
+        )
 
     # ---- Config serialization ---------------------------------------------
 
@@ -976,11 +1065,11 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         with open(store_path) as f:
             state = json.load(f)
         version = state.get("schema_version", 0)
-        if version not in _NODES_SCHEMA_COMPAT:
-            raise ValueError(
-                f"{_STORE_EXT.lstrip('.')} has schema version {version}; "
-                f"this turbovec accepts versions {list(_NODES_SCHEMA_COMPAT)}"
-            )
+        check_schema_version(
+            version,
+            _NODES_SCHEMA_COMPAT,
+            prefix=f"{_STORE_EXT.lstrip('.')} has schema version",
+        )
         # v1/v2 side-cars predate the mode field: their vectors are raw,
         # so dot_product is the mode they actually contain — loading them
         # that way keeps scoring byte-identical to the store that wrote
@@ -1013,7 +1102,12 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
             mapping_name="node_id_to_u64",
             sidecar_name="nodes",
         )
-        check_persisted_handles(index, store._u64_to_node_id.keys(), what="node")
+        check_persisted_handles(
+            index,
+            store._u64_to_node_id.keys(),
+            what="node",
+            next_u64=store._next_u64,
+        )
         return store
 
     @classmethod
@@ -1056,6 +1150,11 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
     # format (``IdMapIndex.to_bytes`` / ``from_bytes``); the per-store
     # lock is excluded — locks cannot cross pickling — and recreated on
     # restore.
+    #
+    # The calibration state round-trips exactly through the copy: an
+    # uncalibrated index copies as uncalibrated, a calibrated one keeps
+    # its fitted pair. A copy is byte-for-byte what ``write`` would have
+    # produced.
 
     def __getstate__(self) -> dict[str, Any]:
         # Snapshot under the writer lock so the index bytes and the

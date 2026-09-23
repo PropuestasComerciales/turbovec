@@ -4,7 +4,8 @@ turbovec exposes two index types and one serialization format per type.
 
 - [`TurboQuantIndex`](#turboquantindex) — positional index, O(1) `swap_remove` delete.
 - [`IdMapIndex`](#idmapindex) — stable external `u64` ids on top of `TurboQuantIndex`.
-- [File formats](#file-formats) — `.tv` and `.tvim`.
+- [TQ+ calibration](#tq-calibration) — the per-coordinate calibration lifecycle.
+- [File formats](#file-formats) — `.tv` and `.tvim`, plus [incremental saves](#incremental-saves--sync).
 
 All examples below are Python. The Rust API mirrors it closely (exceptions noted below) — see each type's rustdoc for the exact signatures.
 
@@ -34,26 +35,29 @@ idx = TurboQuantIndex(bit_width=4)      # dim inferred on first add
 idx.add(vectors)                         # locks dim to vectors.shape[1]
 ```
 
-Before the first add, `idx.dim` is `None`, `len(idx)` is `0`, and `search()` returns empty results.
+Before the first add, `idx.dim` is `None`, `len(idx)` is `0`, and `search()` returns empty results. Adding a zero-row batch is a no-op: `dim` is still checked against the batch, but a lazy index stays lazy and its serialized bytes are unchanged. (On the Rust API, `dim_opt()` is the equivalent of `idx.dim` and returns `Option<usize>`; `dim()` is deprecated — it returns `usize` with `0` for a lazy index, which is unsafe to do arithmetic with, so use `dim_opt()` on any path that can see one.)
 
 ### Methods
 
 | Method | Notes |
 |---|---|
 | `TurboQuantIndex(dim=None, bit_width=4)` | `bit_width ∈ {2, 3, 4}`. `dim` must be a positive multiple of 8 and `≤ 16384` (`MAX_DIM`). `dim` is optional; when omitted it is inferred from the first `add` call. |
-| `add(vectors)` | `vectors` is a contiguous float32 array of shape `(n, dim)`. On a lazy index the first call locks `dim`; subsequent calls must match. Raises `ValueError` on dim mismatch, a zero-width (0-column) batch, or any coordinate that is non-finite (NaN/Inf) or `\|value\| ≥ 1e16`. On the Rust API, a lazy index's first add must use `add_2d(vectors, dim)` — the flat `add(&[f32])` requires an already-committed dim and panics otherwise. (Python arrays carry their shape, so this applies to Rust only.) |
-| `search(queries, k, *, mask=None)` | Returns `(scores, indices)`, both shape `(nq, effective_k)`. Indices are `int64` slot positions. `mask` is an optional `bool` array of length `len(idx)`; when given, only slots with `mask[i] == True` contribute. `effective_k = min(k, mask.sum())`. Raises `ValueError` on a non-finite or `\|value\| ≥ 1e16` query coordinate. |
+| `add(vectors)` | `vectors` is a contiguous float32 array of shape `(n, dim)`. On a lazy index the first call locks `dim`; subsequent calls must match. Raises `ValueError` on dim mismatch, a zero-width (0-column) batch, or any coordinate that is non-finite (NaN/Inf) or `\|value\| ≥ 1e16`. A vector whose L2 norm is at or below `1e-10` has no representable direction and is stored with scale 0, scoring 0 against every query. On the Rust API, a lazy index's first add must use `add_2d(vectors, dim)` — the flat `add(&[f32])` requires an already-committed dim and panics otherwise. (Python arrays carry their shape, so this applies to Rust only.) |
+| `search(queries, k, *, mask=None)` | Returns `(scores, indices)`, both shape `(nq, effective_k)`. Indices are `int64` slot positions. `mask` is an optional `bool` array of length `len(idx)`; when given, only slots with `mask[i] == True` contribute. `effective_k = min(k, mask.sum())`. Raises `ValueError` on a non-finite or `\|value\| ≥ 1e16` query coordinate. The returned ids are invariant to multiplying a query by any positive constant, for as long as the scaled coordinates stay within float32's normal range (smallest normal `1.18e-38`). Scale a query far enough that its coordinates go subnormal and they lose relative precision before scoring, so the ranking can change — measured at query magnitude `~1e-36` for `dim=256` and `~1e-35` for `dim=768`, well below any realistic embedding. The scores are inner products, so they scale with the query. |
 | `swap_remove(idx)` | O(1). Moves the last vector into `idx`; returns the previous position of that moved vector (so external refs can be updated if needed). |
 | `prepare()` | Optional. Eagerly builds the rotation matrix, Lloyd-Max centroids and SIMD-blocked layout so the first `search` call doesn't pay the one-time cost. No-op on a lazy index that hasn't seen its first add. |
-| `write(path)` / `load(path)` | `.tv` format. |
+| `sync(path)` | Incremental save: writes only what changed since the last sync to the same path. See [Incremental saves](#incremental-saves--sync). `load(path)` reads both formats. |
+| `write(path, *, durable=True)` / `load(path)` | `.tv` format. `durable=False` skips the fsync before the atomic rename — faster, but a power loss can lose the file. A `durable=True` save whose post-rename directory fsync fails still succeeds (the file is committed and visible) and raises a `RuntimeWarning` saying the rename may not survive power loss. On the Rust API this is not a flag: use `write_with_durability(path, io::Durability::Fast \| Durable)`. |
 | `to_bytes()` / `from_bytes(data)` | In-memory `.tv` serialization — see [In-memory serialization](#in-memory-serialization). |
+| `pickle` / `copy.copy` / `copy.deepcopy` | Supported on both index types via `__reduce__`; see [In-memory serialization](#in-memory-serialization). Indexes are also weakly referenceable, so one can be cached in a `weakref.WeakValueDictionary`. |
 | `len(idx)` / `idx.dim` / `idx.bit_width` | Introspection. `idx.dim` returns `int` once committed, or `None` on a lazy index that hasn't seen its first add. |
+| `idx.calibration_state` | TQ+ calibration state: `"uncalibrated"` or `"calibrated"` — see [TQ+ calibration](#tq-calibration). |
 
 ### `swap_remove` semantics
 
-`swap_remove(i)` is named to match Rust's [`Vec::swap_remove`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.swap_remove): the last element moves into slot `i`, and the vector is truncated by one. It is **not** a shift (FAISS's `IndexPQ::remove_ids` behaviour). Order is not preserved; slot indices of vectors you didn't delete may now point at different vectors than before.
+`swap_remove(i)` is named to match Rust's [`Vec::swap_remove`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.swap_remove): the last element moves into slot `i`, and the vector is truncated by one. It is **not** a shift — the slots after `i` do not move down by one. Order is not preserved; slot indices of vectors you didn't delete may now point at different vectors than before.
 
-Use [`IdMapIndex`](#idmapindex) if external references have to stay stable across deletes.
+Use [`IdMapIndex`](#idmapindex) if external references have to stay stable across deletes. Search masks are external references too — see [A mask is invalidated by any mutation](#a-mask-is-invalidated-by-any-mutation-not-just-a-length-changing-one).
 
 ### Low-level construction from raw parts (Rust)
 
@@ -77,7 +81,7 @@ It is the single validated entry point for raw-part construction: every structur
 
 ## `IdMapIndex`
 
-Stable-id wrapper around `TurboQuantIndex`. Roughly equivalent to FAISS's `IndexIDMap2` — hash-table backed, O(1) `remove(id)`.
+Stable-id wrapper around `TurboQuantIndex`: a hash-table-backed `u64 id ↔ slot` mapping, with O(1) `remove(id)`. Slot indices still move when a vector is removed, but ids do not.
 
 ```python
 import numpy as np
@@ -109,11 +113,14 @@ idx.add_with_ids(vectors, ids)           # locks dim to vectors.shape[1]
 | `IdMapIndex(dim=None, bit_width=4)` | `bit_width ∈ {2, 3, 4}`; `dim` must be a positive multiple of 8 and `≤ 16384`. `dim` is optional; when omitted it is inferred from the first `add_with_ids` call. |
 | `add_with_ids(vectors, ids)` | `ids` is a `uint64` array with length `vectors.shape[0]`. On a lazy index the first call locks `dim`. Raises `ValueError` on dim mismatch, duplicate ids, `len(ids) != vectors.shape[0]`, a zero-width batch, or a non-finite / `\|value\| ≥ 1e16` coordinate. On the Rust API, a lazy index's first add must use `add_with_ids_2d(vectors, dim, ids)` — the flat `add_with_ids` requires an already-committed dim and panics otherwise. (Rust only; Python arrays carry their shape.) |
 | `remove(id) -> bool` | `True` if the id was present and removed, `False` otherwise. O(1). |
-| `search(queries, k, *, allowlist=None)` | Returns `(scores, ids)` — `ids` are `uint64` external ids. `allowlist` is an optional `uint64` array of ids; when given, results are restricted to those ids and `effective_k = min(k, number of unique ids in allowlist)` (the allowlist is deduplicated; repeated ids don't widen the result). Raises `ValueError` on an empty allowlist or a non-finite / `\|value\| ≥ 1e16` query coordinate, and `KeyError` on unknown ids. |
+| `search(queries, k, *, allowlist=None)` | Returns `(scores, ids)` — `ids` are `uint64` external ids. `allowlist` is an optional `uint64` array of ids; when given, results are restricted to those ids and `effective_k = min(k, number of unique ids in allowlist)` (the allowlist is deduplicated; repeated ids don't widen the result). Raises `ValueError` on an empty allowlist or a non-finite / `\|value\| ≥ 1e16` query coordinate, and `KeyError` on unknown ids. On the Rust API `search_with_allowlist` returns `Result<(Vec<f32>, Vec<u64>), SearchError>` and reports every one of those conditions as `Err`: `AllowlistEmpty`, `UnknownId(id)`, and the query-shape pair `QueryBufferNotMultipleOfDim` / `InvalidQueryValue`. The allowlist-free `search` returns the tuple directly and is the panicking form — it re-panics with the same message on the two query-shape conditions. Rust callers who want the row count and the *effective* `k` rather than a bare tuple use `try_search` / `try_search_with_allowlist`, which return `Result<IdSearchResults, SearchError>` — the id-space counterpart of `SearchResults`, with `scores`, `ids`, `nq`, `k` and `scores_for_query` / `ids_for_query` row accessors. |
 | `contains(id)` / `id in idx` | Membership. |
-| `write(path)` / `load(path)` | `.tvim` format. |
+| `sync(path)` | Incremental save: writes only what changed since the last sync to the same path. See [Incremental saves](#incremental-saves--sync). `load(path)` reads both formats. |
+| `write(path, *, durable=True)` / `load(path)` | `.tvim` format. `durable=False` skips the fsync before the atomic rename — faster, but a power loss can lose the file. A `durable=True` save whose post-rename directory fsync fails still succeeds (the file is committed and visible) and raises a `RuntimeWarning` saying the rename may not survive power loss. On the Rust API this is not a flag: use `write_with_durability(path, io::Durability::Fast \| Durable)`. |
 | `to_bytes()` / `from_bytes(data)` | In-memory `.tvim` serialization — see [In-memory serialization](#in-memory-serialization). |
-| `len(idx)` / `idx.dim` / `idx.bit_width` / `prepare()` | Same as `TurboQuantIndex`. |
+| `pickle` / `copy.copy` / `copy.deepcopy` | Same as `TurboQuantIndex`. |
+| `len(idx)` / `idx.dim` / `idx.bit_width` / `idx.calibration_state` | Same as `TurboQuantIndex`. |
+| `prepare()` | As `TurboQuantIndex.prepare()`, and additionally warms the lazy `id -> slot` map, so the first `search(..., allowlist=)`, `contains()` or `remove()` after a load doesn't pay the one-time O(n) build either. |
 
 ### When to use which
 
@@ -121,6 +128,29 @@ idx.add_with_ids(vectors, ids)           # locks dim to vectors.shape[1]
 - `IdMapIndex` — you need stable external ids (e.g. string-id → vector mapping maintained by the caller).
 
 All the framework integrations (LangChain, LlamaIndex, Haystack) use `IdMapIndex` internally for exactly this reason.
+
+---
+
+## TQ+ calibration
+
+TQ+ fits a per-coordinate `(shift, scale)` pair from the empirical quantiles of a sample of your vectors, and every stored vector is encoded in that one calibrated coordinate system. It is worth roughly +2.5 points of R@10 on average, and up to ~8.7 on the most anisotropic data measured.
+
+The calibration comes from exactly one place: an explicit `idx.calibrate(sample)` call (`calibrate` / `calibrate_2d` in Rust). The index never fits one on its own — an index that is never calibrated is plain TurboQuant, with no fitted state anywhere, and its encoded bytes are independent of how adds were batched or ordered. `idx.calibration_state` reports which of the two states an index is in:
+
+| state | meaning |
+|---|---|
+| `"uncalibrated"` | No calibration committed. Fully functional, just without the TQ+ recall gain. |
+| `"calibrated"` | A calibration is committed, and every stored row is encoded under it — including rows added *before* the `calibrate` call, which that call re-encoded. |
+
+**The sample is your responsibility.** `calibrate` uses every row you give it. Around 1024 rows gets within half a point of R@10 of a fit on the entire corpus on most corpora measured, and 2048 does so everywhere — but it must be a *representative, random* sample of the vectors the index will hold. A sorted or clustered prefix of the same size fits quantiles that are shifted and far too narrow, and actively destroys recall. Passing the whole corpus is always safe.
+
+`calibrate` may be called at any time and repeatedly. On a populated index it re-encodes every stored row from its stored codes — no original vectors needed. Know what that re-encode can and cannot do:
+
+- Refitting with the same or a nearby pair is free: the codes reach an exact fixed point.
+- Calibrating **after** a large uncalibrated ingest costs several points of recall versus calibrating first (the re-encode is a second quantization). Calibrate before adding when you can.
+- A **badly biased** earlier calibration cannot be repaired by refitting: its too-narrow fit clipped coordinates to the outer centroids at encode time, and no later pair recovers what clipping destroyed. Rebuild from the source vectors.
+
+The calibration round-trips exactly through `write`/`load`, `to_bytes`/`from_bytes`, pickling and copying, on both index types. Draining an index to zero vectors keeps its committed calibration.
 
 ---
 
@@ -142,6 +172,14 @@ scores, slots = idx.search(queries, k=10, mask=mask)
 
 The output shape is `(nq, min(k, n_allowed))`, where `n_allowed` is the number of *distinct* allowed vectors — unique ids in the allowlist, or `mask.sum()` for a mask — the same shrinking behaviour you already see when `k > len(idx)`. No `-1` / `NaN` padding; pad on the caller side if you need a fixed-width batch.
 
+### A mask is invalidated by any mutation, not just a length-changing one
+
+A mask names slots, and [`swap_remove`](#swap_remove-semantics) renumbers slots — so **any** mutation invalidates a mask, including one that leaves `len(idx)` unchanged. Rebuild the mask after every mutation.
+
+The length check is not what protects you. It catches only a size difference (`ValueError: mask length 100 does not match index size 99`); a `swap_remove(i)` + `add(...)` pair restores the original length while leaving a *different* vector in slot `i`, so a mask built before that pair passes validation and then silently selects a different set of vectors than you intended. Nothing outside the index leaks and no error is raised — the selected set is simply the wrong one.
+
+Allowlists on `IdMapIndex` do not have this failure mode, because they name external ids and the index never renumbers an id. An allowlist entry for an id that has since been removed raises `KeyError` (Rust: `SearchError::UnknownId`) instead of quietly resolving to some other vector. The one way an allowlist entry can come to name a different vector is if you re-add that same id yourself with different data.
+
 Common use cases:
 
 - Hybrid retrieval where a SQL/BM25 stage produces a candidate id set.
@@ -155,43 +193,52 @@ Common use cases:
 ### `.tv` — `TurboQuantIndex`
 
 ```
-┌──────────────────────────────────────┐
-│ magic    "TVPI"  (4 bytes)            │
-│ version  u8    = 4                     │
-├──────────────────────────────────────┤
-│ core header                           │
-│   bit_width    (u8)                   │
-│   dim          (u32 LE)               │
-│   n_vectors    (u64 LE)               │
-│   rotation fingerprint                │
-│     hash    (u64 LE, FNV-1a)          │
-│     probes  (64 × f32 LE)             │
-├──────────────────────────────────────┤
-│ packed codes                          │
-│   (dim / 8) * bit_width * n_vectors   │
-├──────────────────────────────────────┤
-│ scales  (n_vectors × f32 LE)          │
-│   per-vector length-renormalization   │
-├──────────────────────────────────────┤
-│ TQ+ trailer                           │
-│   n_calib  (u32 LE)  — 0 or dim       │
-│   shift    (n_calib × f32 LE)         │
-│   scale    (n_calib × f32 LE)         │
-└──────────────────────────────────────┘
+┌───────────────────────────────────────────┐
+│ magic    "TVPI"  (4 bytes)                │
+│ version  u8    = 6                        │
+├───────────────────────────────────────────┤
+│ core header                               │
+│   bit_width    (u8)                       │
+│   dim          (u32 LE)                   │
+│   n_vectors    (u64 LE)                   │
+├───────────────────────────────────────────┤
+│ Lloyd-Max codebook                        │
+│   boundaries  ((2^bit_width − 1) × f32 LE)│
+│   centroids   (2^bit_width × f32 LE)      │
+├───────────────────────────────────────────┤
+│ codes — sequential blocked layout         │
+│   n_byte_groups = dim / (8 / bit_width)   │
+│   ceil(n_vectors / 32)                    │
+│     × n_byte_groups × 32 bytes            │
+├───────────────────────────────────────────┤
+│ scales  (n_vectors × f32 LE)              │
+│   per-vector length-renormalization       │
+├───────────────────────────────────────────┤
+│ TQ+ trailer                               │
+│   n_calib  (u32 LE)  — 0 or dim           │
+│   shift    (n_calib × f32 LE)             │
+│   scale    (n_calib × f32 LE)             │
+└───────────────────────────────────────────┘
 ```
+
+The code payload is grouped into 32-vector blocks and padded up to a
+whole block, so it is `ceil(n_vectors / 32) * 32` vectors wide on disk.
+At `bit_width = 3` a byte holds only two codes rather than 8/3, making
+the payload ~33% larger than `dim * bit_width / 8` per vector would
+suggest.
 
 ### `.tvim` — `IdMapIndex`
 
 ```
-┌──────────────────────────────────────┐
-│ magic    "TVIM"  (4 bytes)            │
-│ version  u8    = 4                     │
-├──────────────────────────────────────┤
-│ core payload (same as .tv:            │
-│   header + codes + scales + TQ+)      │
-├──────────────────────────────────────┤
-│ slot_to_id  (n_vectors × u64 LE)      │
-└──────────────────────────────────────┘
+┌───────────────────────────────────────────┐
+│ magic    "TVIM"  (4 bytes)                │
+│ version  u8    = 6                        │
+├───────────────────────────────────────────┤
+│ core payload (same as .tv: header +       │
+│   codebook + codes + scales + TQ+)        │
+├───────────────────────────────────────────┤
+│ slot_to_id  (n_vectors × u64 LE)          │
+└───────────────────────────────────────────┘
 ```
 
 On load, the reverse `id → slot` map is rebuilt in memory. Duplicate ids in the `slot_to_id` table are rejected as corrupt.
@@ -202,12 +249,44 @@ Both index types (de)serialize their wire format in memory, without a filesystem
 
 ```python
 payload = idx.to_bytes()                  # bytes, byte-identical to write(path)'s file
-restored = IdMapIndex.from_bytes(payload) # same validation as load(path)
+restored = IdMapIndex.from_bytes(payload) # same validation as load(path) on a write() file
 ```
 
-`to_bytes()` returns exactly the bytes `write(path)` would put in the file (`.tv` for `TurboQuantIndex`, `.tvim` for `IdMapIndex`). `from_bytes(data)` accepts `bytes` or `bytearray` and applies exactly the same validation as `load` — version handling, structural and value-level checks, and the `.tvim` duplicate-id check — raising `ValueError` on a corrupt payload (there is no file to blame, so it is not an `OSError`). Both release the GIL. This is the path to use for caches, database columns, and pickling; the integration stores' pickle support is built on it.
+`to_bytes()` returns exactly the bytes `write(path)` would put in the file (`.tv` for `TurboQuantIndex`, `.tvim` for `IdMapIndex`). `from_bytes(data)` accepts `bytes` or `bytearray` and applies exactly the same validation `load` applies to a `write()` file — version handling, structural and value-level checks, the embedded codebook check (a v6 file carries the Lloyd-Max codebook, and a file whose codebook is not a valid one for its `(bit_width, dim)` is rejected — the relevant case for anyone hand-writing files through the raw `io::*` writers), and the `.tvim` duplicate-id check — raising `ValueError` on a corrupt payload (there is no file to blame, so it is not an `OSError`). Both release the GIL. This is the path to use for caches and database columns, and it is what both index types' own `pickle` / `copy` support and the integration stores' are built on.
 
-On the Rust API the same pair exists as `to_bytes()` / `from_bytes(&[u8])`, alongside generic-sink forms `write_to_writer<W: Write>` / `load_from_reader<R: Read>` on both types and the raw module-level entry points `io::write_to`, `io::load_from`, `io::write_id_map_to`, `io::load_id_map_from` (whose code-payload parameter is the v6 sequential blocked layout plus the codebook arrays — see `codes_blocked_seq()` / `codebook_for_write()`).
+`pickle.dumps(idx)`, `copy.copy(idx)` and `copy.deepcopy(idx)` work on both index types — they reduce to `from_bytes(to_bytes())`, so an index can cross a `multiprocessing` `spawn` boundary (the default start method on macOS and Windows) and a container holding one can be deep-copied. The copy is fully independent of the original. Everything true of `to_bytes` is therefore true of a pickle — in particular the calibration state round-trips exactly.
+
+Equality and hashing stay identity-based, so `idx == pickle.loads(pickle.dumps(idx))` is `False` even though the two hold the same vectors. Compare `to_bytes()` payloads to check that a saved and a loaded index agree.
+
+An index defines no `__bool__`, so truthiness falls back to `__len__`: an index holding no vectors is **falsy**, and `idx = idx or build_index()` therefore discards a perfectly good empty index. Test for an index with `idx is None`, and for its contents with `len(idx)`.
+
+An index also takes no user attributes (`idx.tag = "x"` raises `AttributeError`) and is not subclassable (`class Sub(IdMapIndex): ...` raises `TypeError`). Both are deliberate. A per-instance `__dict__` is not traversed by the garbage collector, so a reference cycle running through an attribute would leak the whole index rather than being collected, and the attributes would be silently dropped by `pickle` / `copy`, which reduce through `from_bytes(to_bytes())` and carry the payload only. A subclass instance would likewise pickle and copy back to the base class, silently changing type. Attach per-index state by holding the index in an object of your own instead. Re-invoking `idx.__init__(dim=...)` on a built index does nothing at all — it neither resets nor re-shapes it — so build a new index instead of trying to reconfigure one in place.
+
+On the Rust API the same pair exists as `to_bytes()` / `from_bytes(&[u8])`, alongside generic-sink forms `write_to_writer<W: Write>` / `load_from_reader<R: Read>` on both types. All four move the same v7 image the file writers produce: `to_bytes()` is byte-identical to the file `write()` leaves on disk, and `write_to_writer` streams it unit by unit rather than building a second copy in memory. The raw module-level `io::write*` / `io::load*` entry points were removed when v7 became the only format — build an index and use its own methods instead.
+
+On the Rust API `TurboQuantIndex::serialized_len()` returns the exact byte count `to_bytes()` will return and `write(path)` will put in the file, computed from the index's geometry without serializing anything — for sizing a buffer, a database column or a quota check ahead of time. It is exact rather than an upper bound, and `to_bytes()` uses it to allocate its buffer once.
+
+### Incremental saves — `sync()`
+
+`write(path)` rewrites the whole file. `sync(path)` writes only what changed since the last sync to the same path, in a second container format (`.tv` / `.tvim` magic `TV7\0`) built for repeated small commits:
+
+```python
+idx.sync("index.tv")     # first sync to a fresh path: writes the whole container
+idx.add(more_vectors)
+idx.swap_remove(3)
+idx.sync("index.tv")     # writes the delta and commits
+reloaded = TurboQuantIndex.load("index.tv")   # load() recognises both formats
+```
+
+A loaded index stays bound to the path it came from, so it keeps syncing forward incrementally rather than rewriting.
+
+**What it costs.** An append writes the new 32-row blocks plus a commit header. A removal writes no block at all — it rides the commit header as a redo op, and a later sync folds it into its block. The whole-file events are an explicit `calibrate()` (a refit re-encodes every stored code) and enough accumulated removals to exceed the header's op capacity; both compact the file by rewriting it whole, through the same temp-file-and-rename path `write()` uses.
+
+**Durability.** Every sync is durable when it returns — there is no fast mode, and the fsync is `sync_all`, not a data-only variant. A crash at any byte leaves the previous commit intact: the file carries two alternating commit headers, so a torn header fails its checksum and the other one is adopted, and each header names the blocks its own sync wrote along with their digest, so a commit that reached disk ahead of its data is detected rather than served. See [Versioning and limits](#versioning-and-limits) for what this does *not* cover — damage arriving after the write.
+
+**One writer per path.** Each full write stamps the file with a random nonce, so if another process replaces the file underneath a bound index, the next `sync` reports it rather than writing over their commits. Two processes syncing one path concurrently is not supported; the check makes the unsupported case loud, not safe.
+
+**`sync()` files are path-only.** `from_bytes` and `load_from_reader` read the `write()` format. A v7 container needs random access — two header slots, fixed-stride block units, redo ops — which a byte stream cannot serve, and `to_bytes()` only ever emits the `write()` format. Handing v7 bytes to `from_bytes` raises an error saying so and pointing at `load(path)`.
 
 ### Load performance
 
@@ -215,10 +294,16 @@ The file stores the codes in the arch-neutral *sequential blocked* layout the se
 
 ### Versioning and limits
 
-Both `.tv` and `.tvim` loads validate the header **before allocating**: `bit_width` must be 2/3/4, `dim` a positive multiple of 8 and `≤ 16384` (`MAX_DIM` — the same cap enforced at construction, so any index this build can create it can also load back), and every payload size is computed with checked arithmetic and read through a length-capped reader. A malformed or untrusted file therefore raises a clean error rather than panicking, dividing by zero, or driving an oversized allocation. Codebook, scale, and calibration values are additionally validated at the value level (finite, in-support), so a corrupt file fails loudly instead of silently poisoning search results.
+Both `.tv` and `.tvim` loads validate the header **before allocating**: `bit_width` must be 2/3/4, `dim` a positive multiple of 8 and `≤ 16384` (`MAX_DIM` — the same cap enforced at construction, so any index this build can create it can also load back), and every payload size is computed with checked arithmetic and read through a length-capped reader. A malformed or untrusted file therefore raises a clean error rather than panicking, dividing by zero, or driving an oversized allocation. Codebook, scale, and calibration values are additionally validated at the value level (finite, in-support), so a structurally valid file carrying out-of-range values in those fields is rejected rather than loaded.
 
-`n_calib = 0` in the TQ+ trailer means identity calibration (a lazy index with no `add` yet, or a pre-TQ+ index that was re-saved); otherwise it equals `dim`. Loading a version-5 file (packed bit-plane payload, same rotation) is supported transparently and converts on load; versions 1 through 4 predate the v5 rotation break and are rejected with a rebuild hint.
+What that validation does **not** give you is integrity checking of the payload. Neither format checksums its stored codes, and the value-level checks only reject values that leave the valid range — a flipped mantissa bit in a scale is still a finite positive float, and a flipped code byte is indistinguishable from a legitimate one. Damage arriving from outside the writer (a failing disk, a truncated copy, a bad transfer) therefore loads clean and changes search results silently.
+
+Measured by flipping every one of the 32,912 bits of a 4114-byte `.tv` file in turn and loading each result: **1460 flips (4%) are rejected and 31,452 (96%) load and return a different index.** By section, rejections are 144 of 144 header bits, 988 of 992 codebook bits, 169 of 3072 scale bits, 159 of 4128 calibration-trailer bits, and **0 of 24,576 code bits**. The scale and trailer figures are the value-level checks doing exactly what they claim and no more: a flip that drives a float non-finite, negative, or out of support is caught, and every mantissa flip is not. The codes carry no validation of any kind, which is why that column is zero and why it is also the largest section.
+
+This is a deliberate scope choice, not an oversight. A save is atomic and a crash mid-write leaves the previous file intact, so the writer cannot leave a torn index behind; what is out of scope is damage that arrives afterwards. If you need to detect that, checksum the file yourself or store it on a filesystem that does.
+
+`n_calib = 0` in the TQ+ trailer means an uncalibrated index; otherwise it equals `dim`. Only v7 is read: a v5 or v6 file is refused with an error naming its version, and `turbovec::convert` moves a file between v5, v6 and v7 in either direction (`cargo run --example convert -- <in> <out> v7`). Versions 1 through 4 predate the v5 rotation change and cannot be decoded at all — their codes were encoded under a rotation this build cannot reproduce — so they must be rebuilt from the source vectors.
 
 `dim = 0` in the core header signals a lazy uncommitted index. It is only valid alongside `n_vectors = 0`; on load it produces an index whose `dim` is `None` until the first `add` / `add_with_ids` call.
 
-Both formats carry a magic + version byte and are stable across minor versions. Breaking changes bump the version byte: the writer emits version 6 only, and version-6 files are not readable by earlier turbovec releases (their loaders reject the version byte with an "unsupported format version" error — no silent misparse).
+Both formats carry a magic + version byte and are stable across minor versions. Breaking changes bump the version byte. `write()`, `to_bytes()` and `sync()` all produce v7: `write()` and `to_bytes()` an *unclaimed* snapshot, `sync()` a container it claims and then updates incrementally (see [Incremental saves](#incremental-saves--sync)). v7 files are not readable by earlier turbovec releases, whose loaders reject the version byte rather than misparse it; `turbovec::convert` writes a v5 or v6 file for one.

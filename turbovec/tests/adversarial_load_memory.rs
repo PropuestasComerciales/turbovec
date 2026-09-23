@@ -1,0 +1,246 @@
+//! Peak-heap gate on the v7 load path.
+//!
+//! `load` verifies the adopted commit's delta by collecting every unit
+//! that commit's sync wrote into a `Vec<(usize, Vec<u8>)>` and then
+//! copying all of it again into one contiguous digest buffer — on top of
+//! the whole file, which `load` has already read into memory. A sync
+//! that appended most of the index therefore makes the next load's peak
+//! heap roughly three times the file rather than one.
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
+use std::path::PathBuf;
+
+use turbovec::TurboQuantIndex;
+
+thread_local! {
+    static LIVE: Cell<i64> = const { Cell::new(0) };
+    static PEAK: Cell<i64> = const { Cell::new(0) };
+    static ARMED: Cell<bool> = const { Cell::new(false) };
+}
+
+struct TrackingAlloc;
+
+// SAFETY: every method forwards to `System` unchanged; the counters are
+// `Cell`s in const-initialised thread-local storage, so touching them
+// allocates nothing and cannot re-enter the allocator. `try_with`
+// tolerates the TLS-teardown window.
+unsafe impl GlobalAlloc for TrackingAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        note(layout.size() as i64);
+        System.alloc(layout)
+    }
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        note(layout.size() as i64);
+        System.alloc_zeroed(layout)
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        note(-(layout.size() as i64));
+        System.dealloc(ptr, layout)
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        note(new_size as i64 - layout.size() as i64);
+        System.realloc(ptr, layout, new_size)
+    }
+}
+
+fn note(delta: i64) {
+    if !ARMED.try_with(|a| a.get()).unwrap_or(false) {
+        return;
+    }
+    let _ = LIVE.try_with(|l| {
+        let now = l.get() + delta;
+        l.set(now);
+        let _ = PEAK.try_with(|p| {
+            if now > p.get() {
+                p.set(now)
+            }
+        });
+    });
+}
+
+#[global_allocator]
+static ALLOC: TrackingAlloc = TrackingAlloc;
+
+/// Peak live heap, in bytes, reached on this thread while `f` ran.
+fn peak_bytes<T>(f: impl FnOnce() -> T) -> (T, i64) {
+    LIVE.with(|l| l.set(0));
+    PEAK.with(|p| p.set(0));
+    ARMED.with(|a| a.set(true));
+    let out = f();
+    ARMED.with(|a| a.set(false));
+    (out, PEAK.with(|p| p.get()))
+}
+
+const DIM: usize = 128;
+
+fn rows(n: usize, seed: u64) -> Vec<f32> {
+    let mut v = vec![0.0f32; n * DIM];
+    let mut s = seed | 1;
+    for x in v.iter_mut() {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        *x = ((s >> 40) as f32 / (1u64 << 23) as f32) - 0.5;
+    }
+    for row in v.chunks_mut(DIM) {
+        let norm: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
+        for x in row.iter_mut() {
+            *x /= norm;
+        }
+    }
+    v
+}
+
+fn temp(name: &str) -> PathBuf {
+    let mut p = std::env::temp_dir();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    p.push(format!("turbovec-advmem-{nonce}-{name}"));
+    std::fs::create_dir(&p).unwrap();
+    p.push("index.tv");
+    p
+}
+
+#[test]
+fn loading_after_a_large_append_does_not_triple_the_files_footprint() {
+    let path = temp("bigdelta");
+    let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+    idx.calibrate(&rows(1024, 80)).unwrap();
+    idx.add(&rows(1024, 81));
+    idx.sync(&path).unwrap();
+    let small = std::fs::metadata(&path).unwrap().len() as i64;
+
+    // One incremental sync that appends nearly the whole index: its
+    // delta descriptor names every unit it wrote.
+    idx.add(&rows(300_000, 82));
+    let ((), sync_peak) = peak_bytes(|| idx.sync(&path).unwrap());
+    let full = std::fs::metadata(&path).unwrap().len() as i64;
+    // A sync legitimately holds its write payload once, and this one
+    // also materializes the index's packed codes. Anything past that is
+    // the digest keeping a second copy of everything being written.
+    let codes = (301_024 * DIM * 4 / 8) as i64;
+    let sync_budget = full + codes + full / 8;
+    assert!(
+        sync_peak <= sync_budget,
+        "sync peaked at {sync_peak} bytes writing a {full}-byte file ({:.2}x the \
+         file, budget {sync_budget}); the appended payload is held twice",
+        sync_peak as f64 / full as f64
+    );
+    let delta = full - small;
+    assert!(delta > 8 << 20, "the append delta is too small to measure ({delta} bytes)");
+
+    let (loaded, peak) = peak_bytes(|| TurboQuantIndex::load(&path).unwrap());
+    assert_eq!(loaded.len(), 301_024);
+
+    // The load already holds the whole file; a modest working margin on
+    // top is expected. Buffering the delta twice is not.
+    let budget = full + full / 2;
+    assert!(
+        peak <= budget,
+        "load peaked at {peak} bytes for a {full}-byte file ({:.2}x); the \
+         delta covering {delta} bytes is buffered, then copied again, on top \
+         of the file image",
+        peak as f64 / full as f64
+    );
+}
+
+// ---------------------------------------------------------------------
+// v6 load: memory must track declared content, not apparent file length
+// (#487). `write()` always emits an exact-length file, so these only
+// bite on a file some other writer produced, padded, or made sparse —
+// and a sparse file makes a huge apparent length nearly free.
+// ---------------------------------------------------------------------
+
+/// Grow `path` to `len` without writing bytes (a hole).
+fn make_sparse(path: &std::path::Path, len: u64) {
+    let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    f.set_len(len).unwrap();
+}
+
+const PADDED: u64 = 256 * 1024 * 1024;
+
+
+#[test]
+fn a_foreign_file_is_rejected_without_reading_it() {
+    let path = temp("foreign");
+    std::fs::write(&path, b"\x7fELF\x02\x01\x01\x00").unwrap();
+    make_sparse(&path, PADDED);
+
+    let (err, peak) = peak_bytes(|| TurboQuantIndex::load(&path).unwrap_err());
+    assert!(
+        err.to_string().contains("not a turbovec"),
+        "unexpected error: {err}"
+    );
+    // Unfixed: the whole file is read before the magic is compared.
+    assert!(
+        peak < (1 << 20),
+        "rejecting a {PADDED}-byte non-turbovec file peaked at {peak} bytes"
+    );
+}
+
+
+/// #501: a small add onto a tight buffer must not transiently allocate a
+/// second full copy of the codes.
+///
+/// `Vec::reserve` grows amortized, so appending one row to a `len ==
+/// capacity` buffer takes `max(len + additional, capacity * 2)` — a whole
+/// extra copy. Since #475 the packed rows are dropped at the add's commit
+/// point, so that copy is no longer *retained* and a capacity assertion
+/// after the add cannot see it; the cost is peak heap during the add,
+/// which is what this measures.
+///
+/// A v6 load leaves both the codes and the blocked cache capacity-tight,
+/// which is exactly the "load a large index, add a small delta" workflow.
+#[test]
+fn a_small_add_after_a_load_does_not_transiently_double_the_codes() {
+    let path = temp("smalladd");
+    let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+    idx.add(&rows(20_000, 70));
+    idx.write(&path).unwrap();
+    let file = std::fs::metadata(&path).unwrap().len() as i64;
+
+    let mut loaded = TurboQuantIndex::load(&path).unwrap();
+    let ((), peak) = peak_bytes(|| loaded.add(&rows(1, 71)));
+
+    // One extra full copy of the codes would put peak at or above the
+    // file's own size. The fix keeps the add's working set to the rows it
+    // encodes plus an eighth of headroom.
+    assert!(
+        peak < file / 2,
+        "a one-row add after a load peaked at {peak} bytes against a {file}-byte index"
+    );
+    assert_eq!(loaded.len(), 20_001);
+    std::fs::remove_dir_all(path.parent().unwrap()).ok();
+}
+
+/// #487 for v7: a padded or sparse file must cost its declared content,
+/// not its apparent length.
+///
+/// v6 carried this bound and v7 inherited the defect when it became the
+/// only format — `load` read the whole file before any structural check,
+/// so a 97 KB index padded to 256 MiB allocated 256 MiB. `write` always
+/// emits an exact-length file, so this only bites on files turbovec did
+/// not write; a sparse file makes a huge apparent length nearly free.
+#[test]
+fn a_padded_v7_file_costs_its_content_not_its_length() {
+    let path = temp("v7padded");
+    let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+    idx.add(&rows(64, 92));
+    idx.write(&path).unwrap();
+    let content = std::fs::metadata(&path).unwrap().len() as i64;
+
+    let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    f.set_len(256 * 1024 * 1024).unwrap();
+    drop(f);
+
+    let (loaded, peak) = peak_bytes(|| TurboQuantIndex::load(&path).unwrap());
+    assert_eq!(loaded.len(), 64, "the padded file must still load");
+    assert!(
+        peak < content * 4 + (1 << 20),
+        "load of a 256 MiB sparse file holding {content} bytes peaked at {peak}"
+    );
+    std::fs::remove_dir_all(path.parent().unwrap()).ok();
+}

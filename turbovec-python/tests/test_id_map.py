@@ -84,6 +84,46 @@ def test_add_with_ids_rejects_duplicate_id():
         idx.add_with_ids(unit_vectors(1, 128, seed=1), np.array([2], dtype=np.uint64))
 
 
+def test_intra_batch_duplicate_id_does_not_claim_it_is_in_the_index():
+    # The id is repeated inside the batch, not present in the index —
+    # "already present in index" pointed at a phantom insert (#329).
+    idx = IdMapIndex(dim=64)
+    with pytest.raises(ValueError) as exc:
+        idx.add_with_ids(np.zeros((2, 64), dtype=np.float32), np.array([7, 7], dtype=np.uint64))
+    msg = str(exc.value)
+    assert "duplicate id 7 appears more than once in this batch" in msg
+    assert "already present" not in msg
+    assert len(idx) == 0
+
+
+def test_already_present_id_still_says_already_present():
+    idx = IdMapIndex(dim=64)
+    idx.add_with_ids(unit_vectors(1, 64), np.array([7], dtype=np.uint64))
+    with pytest.raises(ValueError) as exc:
+        idx.add_with_ids(unit_vectors(1, 64, seed=1), np.array([7], dtype=np.uint64))
+    assert "id 7 already present in index" in str(exc.value)
+
+
+def test_zero_width_batch_names_the_empty_embedding_cause():
+    # dim == 0 used to be folded into "not a multiple of dim 0" (#329).
+    idx = IdMapIndex()
+    with pytest.raises(ValueError) as exc:
+        idx.add_with_ids(np.zeros((3, 0), dtype=np.float32), np.array([1, 2, 3], dtype=np.uint64))
+    msg = str(exc.value)
+    assert "dim is 0" in msg
+    assert "multiple of" not in msg
+
+
+def test_write_to_missing_directory_names_the_path_and_raises_filenotfound():
+    # write() used to raise a bare OSError naming no file (#329).
+    idx = IdMapIndex(dim=64)
+    idx.add_with_ids(unit_vectors(1, 64), np.array([1], dtype=np.uint64))
+    missing = "/nonexistent-dir-xyz-turbovec/idx.tvim"
+    with pytest.raises(FileNotFoundError) as exc:
+        idx.write(missing)
+    assert missing in str(exc.value)
+
+
 def test_write_and_load_round_trip(tmp_path):
     idx = IdMapIndex(dim=256, bit_width=4)
     vectors = unit_vectors(10, 256, seed=0)
@@ -221,3 +261,51 @@ def test_search_empty_queries_dedups_allowlist_for_effective_k():
     assert empty_ids.shape[1] == real_ids.shape[1]
     assert empty_ids.shape == (0, 1)
     assert real_ids.shape == (1, 1)
+
+
+def test_zero_row_add_with_ids_leaves_lazy_index_uncommitted():
+    """#308: an empty batch must not lock a lazy index's dim."""
+    idx = IdMapIndex(bit_width=4)
+    idx.add_with_ids(
+        np.zeros((0, 768), dtype=np.float32), np.zeros(0, dtype=np.uint64)
+    )
+    assert idx.dim is None
+    assert len(idx) == 0
+    assert idx.to_bytes() == IdMapIndex(bit_width=4).to_bytes()
+
+
+def test_prepare_is_documented_and_mentions_the_id_map():
+    """#348: `IdMapIndex.prepare` had no docstring at all.
+
+    `inspect.getdoc()` returned None while docs/api.md advertised it as
+    "Same as TurboQuantIndex", and the behaviour it now documents (also
+    warming the id -> slot map) is the thing users need to know it does.
+    """
+    import inspect
+
+    doc = inspect.getdoc(IdMapIndex.prepare)
+    assert doc, "IdMapIndex.prepare has no docstring (#348)"
+    assert "id" in doc.lower()
+
+
+def test_prepare_warms_the_allowlist_path():
+    """#348: after prepare(), an allowlist search must work off a warm map.
+
+    Structural rather than timed: the id -> slot build is a few
+    milliseconds and any ratio gate on it would not separate honest from
+    defective runs under CI load. What is asserted here is that prepare()
+    is a legal, idempotent no-op that leaves every map-consuming
+    operation correct — the Rust-side `slots_ready()` assertion in
+    `turbovec/tests/lazy_init.rs` pins that the warm-up actually happened.
+    """
+    dim = 64
+    v = unit_vectors(200, dim, seed=7)
+    ids = np.arange(1000, 1200, dtype=np.uint64)
+    idx = IdMapIndex(dim=dim, bit_width=4)
+    idx.add_with_ids(v, ids)
+    loaded = IdMapIndex.from_bytes(idx.to_bytes())
+    loaded.prepare()
+    loaded.prepare()
+    assert loaded.contains(int(ids[3]))
+    _, got = loaded.search(v[3:4], k=1, allowlist=np.array([ids[3]], dtype=np.uint64))
+    assert int(got[0][0]) == int(ids[3])

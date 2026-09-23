@@ -311,13 +311,32 @@ fn add_with_ids_2d_rejects_non_multiple_buffer() {
 
 #[test]
 fn add_with_ids_2d_rejects_zero_dim() {
-    // Same error variant, dim=0 sub-branch.
+    // dim == 0 is its own variant: folding it into
+    // VectorBufferNotMultipleOfDim produced a message that is
+    // mathematically nonsense and named the wrong cause (issue #329).
     let mut idx = IdMapIndex::new_lazy(4).unwrap();
     let err = idx.add_with_ids_2d(&[], 0, &[]).unwrap_err();
-    assert!(
-        matches!(err, turbovec::AddError::VectorBufferNotMultipleOfDim { .. }),
-        "expected VectorBufferNotMultipleOfDim, got {err:?}",
-    );
+    assert_eq!(err, turbovec::AddError::ZeroDim);
+    let msg = err.to_string();
+    assert!(msg.contains("dim is 0"), "got: {msg}");
+    assert!(!msg.contains("multiple of"), "got: {msg}");
+}
+
+#[test]
+fn add_with_ids_intra_batch_duplicate_is_not_reported_as_already_present() {
+    // An id repeated inside one batch is not present in the index, so
+    // "already present in index" sent users hunting for a phantom
+    // insert (issue #329).
+    let dim = 128;
+    let data = gaussian_normalized(2, dim, 0xA11D_0329);
+    let mut idx = IdMapIndex::new(dim, 4).unwrap();
+    let err = idx.add_with_ids(&data, &[7, 7]).unwrap_err();
+    assert_eq!(err, turbovec::AddError::DuplicateIdInBatch(7));
+    let msg = err.to_string();
+    assert!(msg.contains("more than once in this batch"), "got: {msg}");
+    assert!(!msg.contains("already present"), "got: {msg}");
+    // Rejection is still all-or-nothing.
+    assert_eq!(idx.len(), 0);
 }
 
 #[test]
@@ -460,7 +479,192 @@ fn empty_index_round_trip() {
 
     let restored = IdMapIndex::load(&tmp).expect("load failed");
     assert_eq!(restored.len(), 0);
-    assert_eq!(restored.dim(), dim);
+    assert_eq!(restored.dim_opt().unwrap(), dim);
     assert_eq!(restored.bit_width(), 4);
     std::fs::remove_file(&tmp).ok();
+}
+
+/// Id patterns that stress the `IdHasher` bucket distribution. `i << 32`
+/// is the `shard << 32 | seq` composite-id layout from issue #311: the
+/// low 32 bits are identically zero, and since multiplication only
+/// propagates entropy upward, a bare multiply-shift hash put every one of
+/// these in the same hashbrown bucket region. Other entries here cover the
+/// same failure mode at different alignments plus ordinary orders.
+fn id_patterns() -> Vec<(&'static str, fn(u64) -> u64)> {
+    vec![
+        ("ascending", |i| i),
+        ("descending", |i| u64::MAX - i),
+        ("shl32", |i| i << 32),
+        ("shl32_offset", |i| (i << 32) | 0xDEAD),
+        ("shl16", |i| i << 16),
+        ("pow2_multiples", |i| i.wrapping_mul(1 << 20)),
+        ("scattered", |i| {
+            let mut s = i.wrapping_add(1).wrapping_mul(0x2545_F491_4F6C_DD1D);
+            s ^= s >> 33;
+            s
+        }),
+    ]
+}
+
+#[test]
+fn id_bookkeeping_holds_for_adversarial_id_layouts() {
+    let dim = 32;
+    let n = 2000usize;
+    for (label, mk) in id_patterns() {
+        let ids: Vec<u64> = (0..n as u64).map(mk).collect();
+        // The generators must stay injective at this n, or the test would
+        // be asserting on duplicate-rejection rather than bookkeeping.
+        let mut uniq = ids.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), n, "{label}: generator produced duplicates");
+
+        let data = gaussian_normalized(n, dim, 0x1D_0001);
+        let mut idx = IdMapIndex::new(dim, 4).unwrap();
+        idx.add_with_ids(&data, &ids).unwrap();
+        assert_eq!(idx.len(), n, "{label}");
+        for &id in &ids {
+            assert!(idx.contains(id), "{label}: missing id {id}");
+        }
+        // Duplicate rejection, both against the table and within a call.
+        let one = gaussian_normalized(1, dim, 0x1D_0002);
+        assert!(
+            idx.add_with_ids(&one, &[ids[n / 2]]).is_err(),
+            "{label}: accepted an id already present"
+        );
+        let two = gaussian_normalized(2, dim, 0x1D_0003);
+        let fresh = mk(n as u64 + 1);
+        assert!(
+            idx.add_with_ids(&two, &[fresh, fresh]).is_err(),
+            "{label}: accepted a within-call duplicate"
+        );
+        assert_eq!(idx.len(), n, "{label}: failed add mutated the tables");
+
+        // Remove every third id; the rest must survive with intact lookups.
+        let (removed, kept): (Vec<u64>, Vec<u64>) =
+            ids.iter().partition(|&&id| (id % 3) == 0);
+        let removed: Vec<u64> = removed.into_iter().take(n / 3).collect();
+        for &id in &removed {
+            assert!(idx.remove(id), "{label}: remove({id}) returned false");
+        }
+        assert_eq!(idx.len(), n - removed.len(), "{label}");
+        for &id in &removed {
+            assert!(!idx.contains(id), "{label}: removed id {id} still present");
+            assert!(!idx.remove(id), "{label}: double remove returned true");
+        }
+        for &id in &kept {
+            assert!(idx.contains(id), "{label}: kept id {id} vanished");
+        }
+        // Re-adding a removed id must now succeed.
+        if let Some(&id) = removed.first() {
+            idx.add_with_ids(&one, &[id]).unwrap();
+            assert!(idx.contains(id), "{label}: re-added id {id} missing");
+        }
+    }
+}
+
+#[test]
+fn id_bookkeeping_survives_round_trip_for_adversarial_layouts() {
+    let dim = 32;
+    let n = 1500usize;
+    for (label, mk) in id_patterns() {
+        let ids: Vec<u64> = (0..n as u64).map(mk).collect();
+        let data = gaussian_normalized(n, dim, 0x1D_0011);
+        let mut idx = IdMapIndex::new(dim, 4).unwrap();
+        idx.add_with_ids(&data, &ids).unwrap();
+        let bytes = idx.to_bytes();
+
+        let mut restored = IdMapIndex::from_bytes(&bytes).expect("from_bytes");
+        assert_eq!(restored.len(), n, "{label}");
+        for &id in &ids {
+            assert!(restored.contains(id), "{label}: id {id} lost in round trip");
+        }
+        // Duplicate rejection must hold on the freshly-loaded index too.
+        let one = gaussian_normalized(1, dim, 0x1D_0012);
+        assert!(
+            restored.add_with_ids(&one, &[ids[0]]).is_err(),
+            "{label}: loaded index accepted a duplicate id"
+        );
+
+        // Many single-row adds after a load, in a non-ascending order, then
+        // a full lookup/removal sweep — this is the post-load add path.
+        let extra: Vec<u64> = (0..200u64).map(|i| mk(n as u64 + 1 + i)).collect();
+        for &id in extra.iter().rev() {
+            restored.add_with_ids(&one, &[id]).unwrap();
+        }
+        assert_eq!(restored.len(), n + extra.len(), "{label}");
+        for &id in ids.iter().chain(extra.iter()) {
+            assert!(restored.contains(id), "{label}: id {id} missing after adds");
+        }
+        for &id in extra.iter() {
+            assert!(restored.remove(id), "{label}: remove({id}) after load failed");
+        }
+        assert_eq!(restored.len(), n, "{label}");
+        for &id in &ids {
+            assert!(restored.contains(id), "{label}: original id {id} disturbed");
+        }
+
+        // Search still resolves slots to the right ids after all that churn.
+        let q = &data[..dim];
+        let (_, got) = restored.search(q, 5);
+        assert_eq!(got.len(), 5, "{label}");
+        for id in got {
+            assert!(ids.contains(&id), "{label}: search returned unknown id {id}");
+        }
+    }
+}
+
+/// `try_search` carries the row count and the *effective* `k`, which is
+/// the whole point of it existing next to the tuple-returning `search`.
+///
+/// The failure this pins is the one from #351: `k` is clamped to
+/// `min(k, len)`, so on a 3-vector index queried with `k = 10` the tuple
+/// form hands back rows of 3 with nothing saying so, and the obvious
+/// `&ids[qi * 10..]` reads the wrong row. Every field is checked against
+/// the tuple form's flat buffers so the two cannot drift.
+#[test]
+fn try_search_reports_nq_and_clamped_k() {
+    let dim = 64;
+    let data = gaussian_normalized(3, dim, 7);
+    let mut index = IdMapIndex::new(dim, 4).unwrap();
+    index.add_with_ids(&data, &[10, 20, 30]).unwrap();
+
+    // 2 queries, k requested well above len.
+    let queries = &data[..dim * 2];
+    let res = index.try_search(queries, 10).unwrap();
+
+    assert_eq!(res.nq, 2, "nq must be queries.len() / dim");
+    assert_eq!(res.k, 3, "k must be clamped to len, not the requested 10");
+    assert_eq!(res.scores.len(), res.nq * res.k);
+    assert_eq!(res.ids.len(), res.nq * res.k);
+
+    // Rows are addressable without reconstructing the stride, and each
+    // query's own vector is its own best match.
+    assert_eq!(res.ids_for_query(0)[0], 10);
+    assert_eq!(res.ids_for_query(1)[0], 20);
+    assert_eq!(res.ids_for_query(1), &res.ids[3..6]);
+    assert_eq!(res.scores_for_query(1), &res.scores[3..6]);
+
+    // Identical payload to the tuple form it now backs.
+    let (scores, ids) = index.search(queries, 10);
+    assert_eq!(scores, res.scores);
+    assert_eq!(ids, res.ids);
+
+    // An allowlist narrows the effective k the same way.
+    let allow = index
+        .try_search_with_allowlist(queries, 10, Some(&[10, 30]))
+        .unwrap();
+    assert_eq!(allow.k, 2, "k must clamp to the allowlist size");
+    assert_eq!(allow.nq, 2);
+    assert_eq!(allow.ids_for_query(0).len(), 2);
+    assert!(!allow.ids.contains(&20));
+
+    // `iter_ids` enumerates the live ids in slot order.
+    let listed: Vec<u64> = index.iter_ids().collect();
+    assert_eq!(listed, vec![10, 20, 30]);
+    assert_eq!(index.iter_ids().len(), index.len());
+    index.remove(10);
+    let mut after: Vec<u64> = index.iter_ids().collect();
+    after.sort_unstable();
+    assert_eq!(after, vec![20, 30], "removed id must not be enumerated");
 }

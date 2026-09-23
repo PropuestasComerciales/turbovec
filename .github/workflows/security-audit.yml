@@ -46,13 +46,55 @@ jobs:
       - name: Install zizmor
         run: |
           python -m pip install --upgrade pip
-          python -m pip install zizmor
+          # Pinned, for the same reason actions here are pinned by SHA: the
+          # step below is a hard gate, so an upstream release shipping a new
+          # low/medium/high lint would start failing this workflow with no
+          # commit having changed anything — every pull request that touches
+          # .github/workflows/**, every push to main, and the weekly cron (see
+          # the triggers above). Bump this deliberately and fix whatever the
+          # new version finds in the same pull request.
+          python -m pip install zizmor==1.28.0
       # `--offline` keeps the audit hermetic (no GitHub API calls, no token
-      # needed). Non-gating for now (continue-on-error) so a newly-shipped
-      # zizmor lint can't wedge unrelated PRs; the baseline is clean today, so
-      # this can be tightened to a hard gate once it has proven stable.
+      # needed).
+      #
+      # Gating (no continue-on-error): every workflow now complies with the
+      # low-and-above lints — notably `artipacked`, which is what a checkout
+      # that omits `persist-credentials: false` trips — so a new finding at
+      # those severities is a real regression and must fail the build instead
+      # of being buried in the logs of a green run.
+      #
+      # `--min-severity low` excludes exactly one of zizmor's four severity
+      # tiers — informational, low, medium, high — namely `informational`.
+      # Everything from `low` upwards still gates. Severity is not confidence:
+      # `--min-confidence` is a separate flag on a separate axis, and this
+      # threshold says nothing about it. `artipacked` is reported as *medium
+      # severity* with `audit confidence → Low`, and it gates; the filter here
+      # would not have spared it.
+      #
+      # Be aware of the cost: the excluded findings are filtered out entirely,
+      # not merely un-gated. They do not appear in the log — they collapse into
+      # the trailing `(N ignored, ...)` count, so nothing draws attention to
+      # them. The repo has three today, all `template-injection` on
+      # `${{ steps.msrv.outputs.version }}` in ci.yml: a value produced by an
+      # earlier step in the same workflow rather than by anything an attacker
+      # can reach, which is why they are tolerable. To see them, drop the flag
+      # or run `--min-severity informational` locally.
+      #
+      # A severity floor is the blunt instrument here, chosen because it is
+      # contained. The sharper fix is an inline `# zizmor: ignore[...]`, which
+      # documents each exemption where it applies and lets every tier gate; it
+      # was left out only to keep this change scoped to the workflows it is
+      # about. Prefer that if the informational tier ever needs to be visible
+      # again — but note it goes on the two `run:` keys, ci.yml:256 and :259,
+      # so two comments cover all three findings. Not on 260/261: those are
+      # inside a `run: |` block scalar, where a trailing `#...` is shell text
+      # rather than a YAML comment, so zizmor never sees it. The shell then
+      # discards it as a comment, so the misplacement is silent: no error,
+      # the exemption simply does not take.
+      #
+      # Do not reintroduce continue-on-error to dodge a low/medium/high
+      # finding, and do not raise this threshold to silence one; fix it.
       - name: Run zizmor
-        continue-on-error: true
         run: |
           zizmor --version
-          zizmor --offline --persona regular .github/workflows/
+          zizmor --offline --persona regular --min-severity low .github/workflows/

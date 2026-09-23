@@ -52,7 +52,7 @@ fn search_is_deterministic_across_threads() {
     // Warm up explicitly so no thread races on the lazy init path.
     index.prepare();
 
-    let queries = make_vectors(4, index.dim(), 42);
+    let queries = make_vectors(4, index.dim_opt().unwrap(), 42);
     let k = 10;
 
     // Reference result from the main thread.
@@ -96,7 +96,7 @@ fn lazy_init_is_safe_when_prepare_is_skipped() {
     // one thread initialise each cache while the others block briefly
     // then read the shared value.
     let index = Arc::new(build_index());
-    let queries = make_vectors(2, index.dim(), 7);
+    let queries = make_vectors(2, index.dim_opt().unwrap(), 7);
     let k = 5;
 
     let mut handles = Vec::new();
@@ -133,7 +133,7 @@ fn prepare_is_idempotent_from_multiple_threads() {
     }
 
     // The index must still be usable afterwards.
-    let queries = make_vectors(1, index.dim(), 99);
+    let queries = make_vectors(1, index.dim_opt().unwrap(), 99);
     let r = index.search(&queries, 3);
     assert_eq!(r.k, 3);
 }
@@ -144,7 +144,7 @@ fn add_after_search_invalidates_blocked_cache() {
     // search sees the extended vector set. If we forgot to invalidate,
     // the search would still score against the pre-`add` packed codes.
     let mut index = build_index();
-    let dim = index.dim();
+    let dim = index.dim_opt().unwrap();
     let queries = make_vectors(1, dim, 3);
     let _before = index.search(&queries, 5);
 
@@ -185,7 +185,7 @@ fn add_after_search_invalidates_blocked_cache() {
 #[test]
 fn write_load_preserves_concurrent_search_results() {
     let index = build_index();
-    let queries = make_vectors(3, index.dim(), 123);
+    let queries = make_vectors(3, index.dim_opt().unwrap(), 123);
     let k = 8;
 
     let before = index.search(&queries, k);
@@ -196,7 +196,7 @@ fn write_load_preserves_concurrent_search_results() {
     let _ = std::fs::remove_file(&tmp);
 
     assert_eq!(reloaded.len(), index.len());
-    assert_eq!(reloaded.dim(), index.dim());
+    assert_eq!(reloaded.dim_opt().unwrap(), index.dim_opt().unwrap());
     assert_eq!(reloaded.bit_width(), index.bit_width());
 
     // The reloaded index must produce the same top-k for the same
@@ -227,7 +227,7 @@ fn concurrent_search_after_load_is_safe() {
     let loaded = Arc::new(TurboQuantIndex::load(&tmp).expect("load"));
     let _ = std::fs::remove_file(&tmp);
 
-    let queries = make_vectors(3, loaded.dim(), 0xC0C0_5EE1);
+    let queries = make_vectors(3, loaded.dim_opt().unwrap(), 0xC0C0_5EE1);
     let k = 8;
     let reference: Vec<Vec<i64>> = {
         let r = loaded.search(&queries, k);
@@ -328,5 +328,60 @@ fn concurrent_prepare_races_with_search_safely() {
         if let Some(result) = h.join().unwrap() {
             assert_eq!(result, reference);
         }
+    }
+}
+
+/// Exact score ties (duplicate vectors) must produce identical top-k
+/// members AND ordering on every search path. The construction mirrors
+/// the adversarial-review repro: the duplicated pair is the *tied
+/// minimum* of the top-k while a strictly better vector forces a heap
+/// eviction among the tied minima — the case where the batch heap and
+/// the parallel merge previously chose different survivors.
+#[test]
+fn tied_scores_agree_across_search_paths() {
+    let dim = 64usize;
+    // Derived from the gate, not hard-coded: this test is the only thing
+    // pinning that the nq=1 block-parallel merge and the batch heap
+    // resolve score ties the same way, and it only does so while the
+    // nq=1 arm actually reaches `search_single_query_block_parallel`.
+    // A literal that drifts below the gate silently turns this into a
+    // comparison of the batch path against itself. +44 blocks puts it
+    // clear of the boundary; slots 0/5000/8500 below stay in range.
+    // `* 32` is BLOCK, spelled out as in filtering.rs / input_validation.rs
+    // because `turbovec::BLOCK` is crate-private.
+    let n = (turbovec::search::SINGLE_QUERY_PARALLEL_MIN_BLOCKS + 44) * 32;
+    let mut v = vec![0f32; n * dim];
+    let mut s = 7u64;
+    for x in v.iter_mut() {
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *x = ((s >> 40) as f32) / (1u32 << 24) as f32 - 0.5;
+    }
+    // Query direction u; duplicates 0 and 5000 = u (tied, good score);
+    // 8500 = 3u (same direction, larger pre-normalization scale => higher
+    // score), so with k = 2 the heap must evict one tied duplicate.
+    let u: Vec<f32> = (0..dim).map(|i| ((i * 37 + 11) % 97) as f32 / 97.0 + 0.1).collect();
+    for &slot in &[0usize, 5000] {
+        v[slot * dim..(slot + 1) * dim].copy_from_slice(&u);
+    }
+    let tripled: Vec<f32> = u.iter().map(|x| 3.0 * x).collect();
+    v[8500 * dim..8501 * dim].copy_from_slice(&tripled);
+
+    let mut idx = turbovec::TurboQuantIndex::new(dim, 4).unwrap();
+    idx.add(&v);
+
+    let q = u.clone();
+    for k in [2usize, 3, 5, 10] {
+        // nq=1: reaches search_single_query_block_parallel because `n`
+        // is derived from the gate above.
+        let single = idx.search(&q, k);
+        let mut qq = q.clone();
+        qq.extend_from_slice(&q);
+        let batch = idx.search(&qq, k); // nq=2: batch path
+        assert_eq!(
+            single.indices,
+            batch.indices[..single.indices.len()],
+            "k={k}: tied-score members/order diverge between nq=1 and batch paths",
+        );
+        assert_eq!(single.scores, batch.scores[..single.scores.len()], "k={k} scores");
     }
 }

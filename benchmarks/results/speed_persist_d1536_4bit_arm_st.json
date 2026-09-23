@@ -1,0 +1,16 @@
+{
+  "dim": 1536,
+  "bit_width": 4,
+  "arch": "arm",
+  "threading": "st",
+  "n_vectors": 100000,
+  "tv_file_bytes": 77200146,
+  "tq_write_warm_ms": 176.19,
+  "tq_write_after_mutation_ms": 178.24,
+  "tq_load_ms": 6.54,
+  "tq_load_first_search_ms": 10.44,
+  "tq_mutate_save_load_search_ms": 200.65,
+  "faiss_write_ms": 153.31,
+  "faiss_read_ms": 7.82,
+  "faiss_read_first_search_ms": 16.37
+}

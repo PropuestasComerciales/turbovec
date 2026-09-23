@@ -140,7 +140,7 @@ result = vector_store.query(VectorStoreQuery(
 
 Supported operators on `MetadataFilter`: `EQ`, `NE`, `GT`, `LT`, `GTE`, `LTE`, `IN`, `NIN`, `TEXT_MATCH`, `TEXT_MATCH_INSENSITIVE`, `CONTAINS`, `ANY`, `ALL`, `IS_EMPTY`. Conditions: `AND`, `OR`, `NOT`. Nested `MetadataFilters` work.
 
-Filter semantics match `SimpleVectorStore`'s reference implementation — notably, every operator except `IS_EMPTY` returns `False` when the filter key is missing from the document's metadata, and `TEXT_MATCH` is case-sensitive (use `TEXT_MATCH_INSENSITIVE` for a case-insensitive substring match).
+Filter semantics match `SimpleVectorStore`'s reference implementation — notably, every operator except `IS_EMPTY` returns `False` when the filter key is missing from the document's metadata, and `TEXT_MATCH` is case-insensitive (it lowercases both sides, as `TEXT_MATCH_INSENSITIVE` does).
 
 Filters are resolved to a handle allowlist **before** scoring. Selective filters return up to `similarity_top_k` matches from the filtered set; you never get fewer just because the filter happened to exclude the top-scoring candidates.
 
@@ -184,6 +184,15 @@ await vector_store.adelete("ref-doc-id")
 await vector_store.adelete_nodes(node_ids=[...])
 await vector_store.aclear()
 ```
+
+They run the index work on a worker thread (`asyncio.to_thread`), so the event loop stays responsive while a large add or query is in flight. `BasePydanticVectorStore`'s defaults call straight into the sync body, which would block the loop for the operation's full duration.
+
+Cancellation is only partial, and the distinction matters:
+
+- `asyncio.wait_for`, `task.cancel()`, or a client disconnect returns control to the awaiting caller promptly — that part now works, where previously the coroutine ran to completion and the timeout never fired.
+- It does **not** decide what happened to the add. If the worker thread had already started, it runs the call to completion — work inside the Rust core is not interruptible at all — and the add commits in full. If the executor was saturated, the call is cancelled before it ever starts and nothing is added. **A cancelled `async_add` is "outcome unknown": it may have fully committed, or may never have begun.** Re-adding the same `node_id` is an overwrite, so retrying is safe either way.
+- What *is* guaranteed: the outcome is all-or-nothing. The store is never left in a torn state.
+- Timing out does not make the work go away: the loop's shutdown (`asyncio.run` on the way out, or `loop.shutdown_default_executor()`) waits for the worker thread, so a process that exits right after a short timeout can still block for the rest of the in-flight call.
 
 ## Persist / load
 
@@ -244,6 +253,7 @@ What the contract does *not* cover:
 
 - **No cross-call atomicity.** A caller-side check-then-act sequence (`get_nodes` then `delete_nodes`) can interleave with other writers. Batch writes are not atomic with respect to readers: a query overlapping a re-`add` of an existing `node_id` can briefly see that id under both its old and new entry.
 - **`persist` serializes with writes** (so it always snapshots a consistent store); reads may proceed during a persist.
+- **Two stores writing to the same path is safe.** Concurrent `persist` calls to one destination from several threads each publish atomically and the last writer wins; a caller never sees a torn file, and never an error caused only by the other writer. Which writer wins is not defined.
 - **Multi-process access is not supported.**
 
 ## Known limitations

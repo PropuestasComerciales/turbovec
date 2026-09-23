@@ -10,7 +10,7 @@
 //!   - `IdMapIndex.search_with_allowlist` returns only ids in the allowlist
 //!     and never returns slot indices outside it.
 
-use turbovec::{IdMapIndex, TurboQuantIndex};
+use turbovec::{IdMapIndex, SearchError, TurboQuantIndex};
 
 fn gaussian_normalized(n: usize, dim: usize, seed: u64) -> Vec<f32> {
     let mut state = seed | 1;
@@ -243,7 +243,7 @@ fn allowlist_returns_only_listed_ids() {
 
     let query = gaussian_normalized(1, dim, 0xF11D_1002);
     let allowed: Vec<u64> = vec![1003, 1010, 1042, 1077, 1099];
-    let (scores, returned_ids) = idx.search_with_allowlist(&query, 10, Some(&allowed));
+    let (scores, returned_ids) = idx.search_with_allowlist(&query, 10, Some(&allowed)).unwrap();
 
     assert_eq!(scores.len(), allowed.len(), "effective k = allowlist len");
     assert_eq!(returned_ids.len(), allowed.len());
@@ -267,14 +267,13 @@ fn allowlist_none_equivalent_to_plain_search() {
 
     let query = gaussian_normalized(1, dim, 0xF11D_1004);
     let (s1, i1) = idx.search(&query, 5);
-    let (s2, i2) = idx.search_with_allowlist(&query, 5, None);
+    let (s2, i2) = idx.search_with_allowlist(&query, 5, None).unwrap();
     assert_eq!(s1, s2);
     assert_eq!(i1, i2);
 }
 
 #[test]
-#[should_panic(expected = "allowlist is empty")]
-fn empty_allowlist_panics() {
+fn empty_allowlist_is_an_error_not_a_panic() {
     let dim = 64;
     let data = gaussian_normalized(10, dim, 0xF11D_1005);
     let ids: Vec<u64> = (0..10).collect();
@@ -282,12 +281,14 @@ fn empty_allowlist_panics() {
     idx.add_with_ids(&data, &ids).unwrap();
 
     let query = gaussian_normalized(1, dim, 0xF11D_1006);
-    let _ = idx.search_with_allowlist(&query, 3, Some(&[]));
+    assert_eq!(
+        idx.search_with_allowlist(&query, 3, Some(&[])),
+        Err(SearchError::AllowlistEmpty),
+    );
 }
 
 #[test]
-#[should_panic(expected = "not present in index")]
-fn unknown_id_in_allowlist_panics() {
+fn unknown_id_in_allowlist_is_an_error_not_a_panic() {
     let dim = 64;
     let data = gaussian_normalized(10, dim, 0xF11D_1007);
     let ids: Vec<u64> = (0..10).collect();
@@ -295,7 +296,12 @@ fn unknown_id_in_allowlist_panics() {
     idx.add_with_ids(&data, &ids).unwrap();
 
     let query = gaussian_normalized(1, dim, 0xF11D_1008);
-    let _ = idx.search_with_allowlist(&query, 3, Some(&[5, 999]));
+    assert_eq!(
+        idx.search_with_allowlist(&query, 3, Some(&[5, 999])),
+        Err(SearchError::UnknownId(999)),
+    );
+    // The index is still usable afterwards — the error is recoverable.
+    assert_eq!(idx.search(&query, 3).1.len(), 3);
 }
 
 #[test]
@@ -389,6 +395,7 @@ fn block_skip_at_extreme_selectivity_returns_only_allowed() {
 }
 
 #[test]
+#[cfg(feature = "mask-skip-counter")]
 fn block_skip_path_actually_fires_under_selective_mask() {
     // Direct activation test for the block-level early-exit path. The
     // correctness tests above would still pass if the block-skip guard
@@ -420,9 +427,13 @@ fn block_skip_path_actually_fires_under_selective_mask() {
     let query = gaussian_normalized(1, dim, 0xC0DE_5418);
 
     reset_blocks_skipped_by_mask();
-    let before = blocks_skipped_by_mask();
+    // `None` means this build compiled the counter out; the test binary
+    // enables `mask-skip-counter` through the self dev-dependency, so a
+    // `None` here means that wiring broke rather than that no block was
+    // skipped — which is exactly the distinction the Option exists for.
+    let before = blocks_skipped_by_mask().expect("test build must enable mask-skip-counter");
     let _ = idx.search_with_mask(&query, 8, Some(&mask));
-    let after = blocks_skipped_by_mask();
+    let after = blocks_skipped_by_mask().expect("test build must enable mask-skip-counter");
     let delta = after - before;
 
     // Lower bound: at least one block must have been skipped, otherwise
@@ -481,12 +492,215 @@ fn allowlist_survives_swap_remove() {
     let allowed: Vec<u64> = vec![5005, 5015, 5020];
     let query = gaussian_normalized(1, dim, 0xF11D_100A);
 
-    let _before = idx.search_with_allowlist(&query, 3, Some(&allowed));
+    let _before = idx.search_with_allowlist(&query, 3, Some(&allowed)).unwrap();
     // Removing an id NOT in the allowlist; the allowlist should remain valid.
     assert!(idx.remove(5025));
-    let after = idx.search_with_allowlist(&query, 3, Some(&allowed));
+    let after = idx.search_with_allowlist(&query, 3, Some(&allowed)).unwrap();
     assert_eq!(after.1.len(), 3);
     for id in &after.1 {
         assert!(allowed.contains(id));
+    }
+}
+
+/// Index large enough (>= `SINGLE_QUERY_PARALLEL_MIN_BLOCKS` blocks of 32
+/// vectors) that a single-query search takes the block-parallel path.
+/// That path used to be gated on `mask.is_none()`, so every masked
+/// search fell back to the serial per-query path; it now carries a
+/// word-aligned slice of the bitmap per range. These tests pin that the
+/// parallel masked results are identical to the post-hoc-filtered
+/// reference, and identical at any thread count.
+///
+/// Derived from the constant rather than hard-coded so raising the
+/// threshold (#336) cannot silently move these tests off the path they
+/// exist to cover.
+const BLOCK_PARALLEL_N: usize =
+    (turbovec::search::SINGLE_QUERY_PARALLEL_MIN_BLOCKS + 44) * 32;
+
+fn assert_masked_matches_reference(mask: &[bool], k: usize, seed: u64) {
+    let dim = 64;
+    let idx = build_index(BLOCK_PARALLEL_N, dim, seed);
+    let query = gaussian_normalized(1, dim, seed ^ 0xFFFF);
+    let masked = idx.search_with_mask(&query, k, Some(mask));
+    let (ref_scores, ref_indices) = reference_topk(&idx, &query, mask, k);
+    assert_eq!(&masked.scores[..masked.k], &ref_scores[..], "score mismatch");
+    assert_eq!(&masked.indices[..masked.k], &ref_indices[..], "index mismatch");
+    for &slot in &masked.indices[..masked.k] {
+        assert!(mask[slot as usize], "returned disallowed slot {slot}");
+    }
+}
+
+#[test]
+fn block_parallel_masked_all_true_matches_unmasked() {
+    let dim = 64;
+    let idx = build_index(BLOCK_PARALLEL_N, dim, 0xF11D_2001);
+    let query = gaussian_normalized(1, dim, 0xF11D_2002);
+    let mask = vec![true; BLOCK_PARALLEL_N];
+    let unmasked = idx.search(&query, 20);
+    let masked = idx.search_with_mask(&query, 20, Some(&mask));
+    assert_eq!(unmasked.k, masked.k);
+    assert_eq!(unmasked.scores, masked.scores);
+    assert_eq!(unmasked.indices, masked.indices);
+}
+
+#[test]
+fn block_parallel_masked_sparse_matches_reference() {
+    // Sparse enough that whole 32-vector blocks are skipped, exercising
+    // the range-relative block_has_allowed path.
+    let mut mask = vec![false; BLOCK_PARALLEL_N];
+    for i in (0..BLOCK_PARALLEL_N).step_by(97) {
+        mask[i] = true;
+    }
+    assert_masked_matches_reference(&mask, 10, 0xF11D_2003);
+}
+
+#[test]
+fn block_parallel_masked_dense_matches_reference() {
+    let mut mask = vec![false; BLOCK_PARALLEL_N];
+    for (i, m) in mask.iter_mut().enumerate() {
+        *m = i % 3 != 0;
+    }
+    assert_masked_matches_reference(&mask, 25, 0xF11D_2004);
+}
+
+#[test]
+fn block_parallel_masked_tail_and_head_only() {
+    // Allowed slots confined to the first and last block: every range in
+    // between skips wholesale, and the surviving ranges must still report
+    // absolute slot indices.
+    let mut mask = vec![false; BLOCK_PARALLEL_N];
+    for m in mask.iter_mut().take(32) {
+        *m = true;
+    }
+    for m in mask.iter_mut().skip(BLOCK_PARALLEL_N - 32) {
+        *m = true;
+    }
+    assert_masked_matches_reference(&mask, 8, 0xF11D_2005);
+}
+
+#[test]
+fn block_parallel_masked_results_are_thread_count_invariant() {
+    let dim = 64;
+    let idx = build_index(BLOCK_PARALLEL_N, dim, 0xF11D_2006);
+    let query = gaussian_normalized(1, dim, 0xF11D_2007);
+    let mut mask = vec![false; BLOCK_PARALLEL_N];
+    for (i, m) in mask.iter_mut().enumerate() {
+        *m = i % 5 != 0;
+    }
+    let default_threads = idx.search_with_mask(&query, 16, Some(&mask));
+    for threads in [1usize, 2, 3, 7] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("pool build");
+        let got = pool.install(|| idx.search_with_mask(&query, 16, Some(&mask)));
+        assert_eq!(got.k, default_threads.k, "k differs at {threads} threads");
+        assert_eq!(
+            got.scores, default_threads.scores,
+            "scores differ at {threads} threads"
+        );
+        assert_eq!(
+            got.indices, default_threads.indices,
+            "indices differ at {threads} threads"
+        );
+    }
+}
+
+#[test]
+fn block_parallel_mask_allows_fewer_than_k() {
+    // n_allowed < k: effective_k must clamp and no disallowed slot may leak.
+    let dim = 64;
+    let idx = build_index(BLOCK_PARALLEL_N, dim, 0xF11D_2008);
+    let query = gaussian_normalized(1, dim, 0xF11D_2009);
+    let mut mask = vec![false; BLOCK_PARALLEL_N];
+    for i in [3usize, 4000, 9500] {
+        mask[i] = true;
+    }
+    let masked = idx.search_with_mask(&query, 10, Some(&mask));
+    assert_eq!(masked.k, 3);
+    for &slot in &masked.indices[..masked.k] {
+        assert!(mask[slot as usize], "returned disallowed slot {slot}");
+    }
+}
+
+/// #349: an empty query batch must not panic. The divisor is
+/// `(n_threads * TILES_PER_THREAD).div_ceil(n_quads)` in `n_block_ranges`, fed by
+/// `n_quads = nq.div_ceil(QBS)`, which is zero for `nq == 0`.
+///
+/// The filtered forms reach that division too, but only on aarch64: the
+/// x86 dispatch marks a masked search serial, so `n_block_ranges`
+/// returns before dividing, while the aarch64
+/// dispatch passes `serial = false` for masked and unmasked alike. So
+/// pinning the unmasked form alone would leave the masked one covered on
+/// exactly one target.
+///
+/// Runs on an explicit multi-thread pool: `n_threads == 1` short-circuits
+/// ahead of the division, which would make every assertion here vacuous
+/// on a single-core runner.
+#[test]
+fn empty_query_batch_is_not_a_panic_at_any_index_size() {
+    let dim = 64;
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(8).build().unwrap();
+    for &n in &[16usize, 8160, 8161, 9000] {
+        let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+        idx.add_2d(&gaussian_normalized(n, dim, 0x3490 + n as u64), dim).unwrap();
+        idx.prepare();
+        let res = pool.install(|| idx.search(&[], 5));
+        assert_eq!(res.nq, 0, "n={n}: empty batch must report nq = 0");
+        assert!(res.indices.is_empty(), "n={n}: empty batch returned indices");
+
+        // Same batch through the mask path.
+        let mask = vec![true; n];
+        let masked = pool.install(|| idx.search_with_mask(&[], 5, Some(&mask)));
+        assert_eq!(masked.nq, 0, "n={n}: masked empty batch must report nq = 0");
+        assert!(masked.indices.is_empty(), "n={n}: masked empty batch returned indices");
+
+        let mut ids = IdMapIndex::new(dim, 4).unwrap();
+        let id_vals: Vec<u64> = (0..n as u64).collect();
+        ids.add_with_ids_2d(&gaussian_normalized(n, dim, 0x3491 + n as u64), dim, &id_vals)
+            .unwrap();
+        ids.prepare();
+        let (scores, out_ids) = pool.install(|| ids.search(&[], 5));
+        assert!(scores.is_empty() && out_ids.is_empty(), "n={n}: id-map empty batch");
+
+        let allow: Vec<u64> = id_vals.iter().copied().take(3).collect();
+        let (scores, out_ids) =
+            pool.install(|| ids.search_with_allowlist(&[], 5, Some(&allow)).unwrap());
+        assert!(
+            scores.is_empty() && out_ids.is_empty(),
+            "n={n}: id-map empty batch with an allowlist"
+        );
+    }
+}
+
+/// The block-parallel single-query path skips a block whose SIMD max
+/// cannot beat the running heap minimum (#493). The prune is only sound
+/// if it never changes a result, so compare each `k` against the full
+/// ranking of the same index — taken at `k == n`, where the heap does not
+/// fill until the very end and the prune therefore almost never fires.
+///
+/// Ties are the interesting case: with an evict-largest-index tie-break,
+/// a prune that fired one block too eagerly would silently keep the wrong
+/// one of two equal scores, which a score-only comparison would miss.
+#[test]
+fn block_parallel_prune_preserves_results_at_every_k() {
+    let dim = 64;
+    for &seed in &[0xBEEF_0001u64, 0xBEEF_0002, 0xBEEF_0003] {
+        let idx = build_index(BLOCK_PARALLEL_N, dim, seed);
+        let all = vec![true; BLOCK_PARALLEL_N];
+        for &k in &[1usize, 10, 64, 100] {
+            let query = gaussian_normalized(1, dim, seed ^ 0xABCD);
+            let got = idx.search(&query, k);
+            let (want_scores, want_indices) = reference_topk(&idx, &query, &all, k);
+            assert_eq!(
+                got.scores[..got.k].iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
+                want_scores.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
+                "scores differ from the full ranking at k={k}, seed={seed:#x}"
+            );
+            assert_eq!(
+                &got.indices[..got.k],
+                &want_indices[..],
+                "indices differ from the full ranking at k={k}, seed={seed:#x}"
+            );
+        }
     }
 }

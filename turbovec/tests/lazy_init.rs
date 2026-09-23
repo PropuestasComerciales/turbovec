@@ -14,7 +14,7 @@
 //!     committed index round-trips exactly.
 
 use std::fs;
-use turbovec::{IdMapIndex, TurboQuantIndex};
+use turbovec::{AddError, IdMapIndex, TurboQuantIndex};
 
 const DIM: usize = 64;
 
@@ -63,7 +63,6 @@ fn unit_vectors(n: usize, dim: usize, seed: u64) -> Vec<f32> {
 fn new_lazy_starts_with_no_dim() {
     let idx = TurboQuantIndex::new_lazy(4).unwrap();
     assert_eq!(idx.dim_opt(), None);
-    assert_eq!(idx.dim(), 0, "dim() returns 0 as sentinel");
     assert_eq!(idx.len(), 0);
     assert_eq!(idx.bit_width(), 4);
 }
@@ -234,7 +233,6 @@ fn write_load_round_trip_lazy_after_committed_add() {
 fn id_map_new_lazy_starts_with_no_dim() {
     let idx = IdMapIndex::new_lazy(4).unwrap();
     assert_eq!(idx.dim_opt(), None);
-    assert_eq!(idx.dim(), 0);
     assert_eq!(idx.len(), 0);
 }
 
@@ -334,4 +332,170 @@ fn id_map_new_rejects_bad_bit_width() {
 fn id_map_new_rejects_bad_dim() {
     let err = IdMapIndex::new(0, 4).err().unwrap();
     assert_eq!(err, turbovec::ConstructError::DimNotPositiveMultipleOf8(0));
+}
+
+// ---- #318: dim() on a lazy index ----
+
+// `dim()` keeps returning the 0 sentinel — it is deprecated rather than
+// changed, so code written against the published contract still compiles
+// and behaves the same. `dim_opt()` is the replacement that makes the
+// uncommitted case impossible to ignore.
+#[test]
+#[allow(deprecated)]
+fn dim_returns_sentinel_on_lazy_index_and_dim_opt_is_none() {
+    let idx = TurboQuantIndex::new_lazy(4).unwrap();
+    assert_eq!(idx.dim_opt(), None);
+    assert_eq!(idx.dim(), 0);
+
+    let idx = IdMapIndex::new_lazy(4).unwrap();
+    assert_eq!(idx.dim_opt(), None);
+    assert_eq!(idx.dim(), 0);
+}
+
+// ---- #308: a zero-row add is a true no-op on a lazy index ----
+
+#[test]
+fn zero_row_add_2d_leaves_lazy_index_uncommitted() {
+    let mut idx = TurboQuantIndex::new_lazy(4).unwrap();
+    idx.add_2d(&[], DIM).unwrap();
+    assert_eq!(idx.dim_opt(), None, "zero-row add must not commit dim");
+    assert_eq!(idx.len(), 0);
+
+    // The index is still free to commit to a different dim afterwards.
+    let other = 2 * DIM;
+    let data = unit_vectors(3, other, 0xA00D_0308);
+    idx.add_2d(&data, other).unwrap();
+    assert_eq!(idx.dim_opt(), Some(other));
+}
+
+#[test]
+fn zero_row_add_2d_does_not_change_serialized_bytes() {
+    let pristine = TurboQuantIndex::new_lazy(4).unwrap().to_bytes();
+    let mut poked = TurboQuantIndex::new_lazy(4).unwrap();
+    poked.add_2d(&[], DIM).unwrap();
+    assert_eq!(poked.to_bytes(), pristine, "no-op add changed the bytes");
+
+    let back = TurboQuantIndex::from_bytes(&poked.to_bytes()).unwrap();
+    assert_eq!(back.dim_opt(), None);
+}
+
+#[test]
+fn zero_row_add_2d_still_validates_dim() {
+    // Committed dim: a zero-row batch of the wrong dim is still a mismatch.
+    let mut idx = TurboQuantIndex::new_lazy(4).unwrap();
+    let data = unit_vectors(2, DIM, 0xA00D_0309);
+    idx.add_2d(&data, DIM).unwrap();
+    assert!(matches!(
+        idx.add_2d(&[], DIM + 8),
+        Err(AddError::DimMismatch { .. })
+    ));
+    idx.add_2d(&[], DIM).unwrap();
+    assert_eq!(idx.len(), 2);
+
+    // Lazy: a malformed dim is rejected rather than silently accepted.
+    let mut lazy = TurboQuantIndex::new_lazy(4).unwrap();
+    assert!(matches!(
+        lazy.add_2d(&[], 7),
+        Err(AddError::DimNotMultipleOf8(7))
+    ));
+    assert_eq!(lazy.dim_opt(), None);
+}
+
+#[test]
+fn zero_row_add_with_ids_2d_leaves_lazy_id_map_uncommitted() {
+    let mut idx = IdMapIndex::new_lazy(4).unwrap();
+    idx.add_with_ids_2d(&[], DIM, &[]).unwrap();
+    assert_eq!(idx.dim_opt(), None);
+    assert_eq!(idx.len(), 0);
+}
+
+/// `slots_ready()` must track the id → slot map's materialization exactly:
+/// the Python binding uses it to decide whether `remove` can run attached
+/// to the GIL, and a probe that reported "ready" while the map was still
+/// empty would put the O(n) build back under the GIL (issue #319).
+#[test]
+fn id_map_slots_ready_tracks_the_lazy_map() {
+    let n = 64;
+    let vectors = unit_vectors(n, DIM, 3);
+    let ids: Vec<u64> = (0..n as u64).collect();
+
+    // Every non-load construction path materializes the map eagerly.
+    let mut index = IdMapIndex::new(DIM, 4).unwrap();
+    assert!(index.slots_ready());
+    index.add_with_ids(&vectors, &ids).unwrap();
+    assert!(index.slots_ready());
+
+    let dir = std::env::temp_dir().join(format!("tv_slots_ready_{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("i.tvim");
+    index.write(&path).unwrap();
+
+    // A load defers the build, and searching never triggers it.
+    let mut loaded = IdMapIndex::load(&path).unwrap();
+    assert!(!loaded.slots_ready());
+    loaded.search(&vectors[..DIM], 5);
+    assert!(!loaded.slots_ready());
+
+    // The first slot-consuming op pays for it, and it stays ready after.
+    assert!(loaded.remove(0));
+    assert!(loaded.slots_ready());
+
+    let loaded = IdMapIndex::load(&path).unwrap();
+    assert!(!loaded.slots_ready());
+    assert!(loaded.contains(1));
+    assert!(loaded.slots_ready());
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// `IdMapIndex::prepare()` must warm the lazy id → slot map, not just the
+/// inner index's search caches (#348).
+///
+/// The Python binding documents `prepare` as absorbing the one-time
+/// initialisation cost so the first call after it is fast. Forwarding to
+/// `inner.prepare()` alone left `id_to_slot` unbuilt, so the first
+/// allowlist search / `contains` / `remove` after a load still paid the
+/// O(n) build — measured at 2.58 ms vs 0.73 ms warm on a 500k index,
+/// while `prepare()` itself returned in 0.01 ms.
+///
+/// Asserted structurally through `slots_ready()` rather than by timing:
+/// the build is a few milliseconds and a ratio gate on it would not
+/// separate honest from defective runs on a loaded CI box.
+#[test]
+fn id_map_prepare_warms_the_lazy_slot_map() {
+    let n = 256;
+    let vectors = unit_vectors(n, DIM, 11);
+    let ids: Vec<u64> = (0..n as u64).map(|i| i * 7 + 3).collect();
+
+    let mut index = IdMapIndex::new(DIM, 4).unwrap();
+    index.add_with_ids(&vectors, &ids).unwrap();
+
+    let dir = std::env::temp_dir().join(format!("tv_prepare_slots_{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("i.tvim");
+    index.write(&path).unwrap();
+
+    let loaded = IdMapIndex::load(&path).unwrap();
+    assert!(
+        !loaded.slots_ready(),
+        "a load must start with the map deferred, or this test proves nothing",
+    );
+    loaded.prepare();
+    assert!(
+        loaded.slots_ready(),
+        "prepare() left the id -> slot map cold, so the first allowlist \
+         search / contains / remove still pays the O(n) build (#348)",
+    );
+
+    // Warm prepare stays a no-op, and the index is still correct after it.
+    loaded.prepare();
+    assert!(loaded.slots_ready());
+    assert!(loaded.contains(ids[5]));
+    assert!(!loaded.contains(u64::MAX));
+    let (_, got) = loaded
+        .search_with_allowlist(&vectors[..DIM], 1, Some(&[ids[0]]))
+        .unwrap();
+    assert_eq!(got, vec![ids[0]]);
+
+    fs::remove_dir_all(&dir).ok();
 }

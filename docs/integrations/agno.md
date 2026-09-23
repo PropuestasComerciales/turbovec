@@ -49,7 +49,7 @@ TurboQuantVectorDb(
 | `bit_width` | Quantization width per coordinate; one of `{2, 3, 4}`. |
 | `search_type` | Only `SearchType.vector` is supported. Constructing with `keyword` or `hybrid` raises `ValueError` (keyword/hybrid would require an external BM25/lexical index that turbovec doesn't ship). |
 | `distance` | `Distance.cosine` (default) or `Distance.max_inner_product` — see [Similarity modes](#similarity-modes). `Distance.l2` raises `ValueError`. |
-| `similarity_threshold` | Optional. Scores are mapped to relevance `[0, 1]` via `(s + 1) / 2`; results below the threshold are dropped. Meaningful under `Distance.cosine`; dataset-relative under `Distance.max_inner_product` (see below). |
+| `similarity_threshold` | Optional. Results scoring below the threshold are dropped. Under `Distance.cosine` the score is the raw cosine, clamped to `[0, 1]` — the same definition agno's `normalize_cosine` and the pgvector backend use. Under `Distance.max_inner_product` the raw inner product is mapped via `(ip + 1) / 2` and thresholds are dataset-relative (see below). |
 | `reranker` | Optional Agno reranker applied to the result set after vector retrieval. |
 | `path` | Optional directory for save/load persistence. When given, `create()` loads existing data from this path if present. |
 
@@ -57,8 +57,8 @@ TurboQuantVectorDb(
 
 The `distance` parameter selects how scores are computed. It is fixed for the lifetime of the store:
 
-- **`Distance.cosine` (default).** Document embeddings are L2-normalized at insert time and query embeddings at search time, so the kernel's raw score is cosine similarity in `[-1, 1]` for embeddings of any magnitude, and `similarity_threshold` (which compares against `(s + 1) / 2`) behaves as a true `[0, 1]` relevance cutoff. Zero vectors are kept as-is and score `0` against everything.
-- **`Distance.max_inner_product`.** Vectors are stored and queried raw: ranking is by raw inner product (magnitude-aware). The `(s + 1) / 2` mapping saturates at 0/1 once raw scores leave `[-1, 1]`, so `similarity_threshold` values are dataset-relative in this mode — calibrate against your embedder, or leave the threshold unset.
+- **`Distance.cosine` (default).** Document embeddings are L2-normalized at insert time and query embeddings at search time, so the kernel's raw score is cosine similarity in `[-1, 1]` for embeddings of any magnitude, and `similarity_threshold` compares against that cosine directly, so it behaves as a true `[0, 1]` relevance cutoff. A negative cosine clamps to 0, so any positive threshold drops it. Zero vectors are kept as-is and score `0` against everything.
+- **`Distance.max_inner_product`.** Vectors are stored and queried raw: ranking is by raw inner product (magnitude-aware). The `(ip + 1) / 2` mapping agno defines for this mode saturates at 0/1 once raw scores leave `[-1, 1]`, so `similarity_threshold` values are dataset-relative here — calibrate against your embedder, or leave the threshold unset.
 
 ## Insert / upsert
 
@@ -110,7 +110,7 @@ vector_db.delete_by_name("paper.pdf")             # by Document.name
 vector_db.delete_by_metadata({"source": "web"})   # AND-of-equality on meta_data
 vector_db.delete_by_content_id("cid-42")          # by Document.content_id
 vector_db.drop()                                  # clear all
-vector_db.delete()                                # alias for drop(), returns True
+vector_db.delete()                                # returns False, deletes nothing — use drop()
 ```
 
 Each `delete_by_*` returns `True` iff at least one document was removed. `delete_by_name` / `delete_by_content_id` / `delete_by_metadata` remove only the documents matching that exact predicate, even when other stored documents share the same derived `doc_id`. `delete_by_id` removes every document under that internal id.
@@ -138,6 +138,8 @@ Writes two files under the given folder path:
 - `index.tvim` — the `IdMapIndex` payload.
 - `docstore.json` — JSON-encoded document text, metadata, and id maps.
 
+`create()` starts a fresh empty index only when the folder holds neither file. A folder holding just one of them is a partial save, and `create()` raises `FileNotFoundError` rather than starting empty — starting empty there would let the next `save()` overwrite the surviving file.
+
 Document metadata must be JSON-serializable — same constraint Agno's `LanceDb` imposes on its payload column. The side-car carries a `schema_version` field; loaders refuse to deserialize unknown versions, and validate that the side-car's id maps are consistent with the loaded `index.tvim` (a mismatched or out-of-sync pair raises at load rather than failing later at query time).
 
 The similarity mode is recorded in `docstore.json`. Because the store is constructed (with a `distance`) before `create()` loads the files, a recorded mode that conflicts with the constructor's raises `ValueError` — construct with the matching `distance` to load. A save written before the mode field existed holds raw, unnormalized vectors: it loads as `Distance.max_inner_product` — exactly the scoring it was written under — and `self.distance` is updated to reflect that.
@@ -148,7 +150,16 @@ The store also supports `pickle` (e.g. for `multiprocessing` workers, provided t
 
 ## Async
 
-The lifecycle, write, and read methods have async counterparts: `async_create`, `async_drop`, `async_exists`, `async_name_exists`, `async_get_count`, `async_insert`, `async_upsert`, `async_search`. The remaining methods (the `delete_by_*` family, `update_metadata`, `save`, `id_exists`, `content_hash_exists`, `optimize`) are sync-only. When the embedder exposes `async_get_embedding` / `async_get_embeddings_batch_and_usage`, the async paths use it for genuine async embedding generation.
+The lifecycle, write, and read methods have async counterparts: `async_create`, `async_drop`, `async_exists`, `async_name_exists`, `async_get_count`, `async_insert`, `async_upsert`, `async_search`. The remaining methods (the `delete_by_*` family, `update_metadata`, `save`, `id_exists`, `content_hash_exists`, `optimize`) are sync-only. The async paths call the embedder's `async_get_embedding` / `async_get_embeddings_batch_and_usage` for genuine async embedding generation. Agno's `Embedder` base class always defines both, so an embedder that inherits them without implementing them raises `NotImplementedError` on the async paths — use the sync methods with such an embedder.
+
+`async_create`, `async_drop`, `async_insert`, `async_upsert`, and `async_search` run the index work on a worker thread (`asyncio.to_thread`) so the event loop stays responsive while a large insert or search is in flight. That is the shape Agno's own sync-backed vector DBs use (`chromadb`, `pgvector`, `cassandra`, `pineconedb` all wrap their sync bodies in `asyncio.to_thread`). `async_exists`, `async_name_exists`, and `async_get_count` answer inline — they are O(1) reads, and a thread hop would cost more than it saves.
+
+Cancellation is only partial, and the distinction matters:
+
+- `asyncio.wait_for`, `task.cancel()`, or a client disconnect returns control to the awaiting caller promptly — that part now works, where previously the coroutine ran to completion and the timeout never fired.
+- It does **not** decide what happened to the insert. If the worker thread had already started, it runs the call to completion — work inside the Rust core is not interruptible at all — and the insert commits in full. If the executor was saturated, the call is cancelled before it ever starts and nothing is inserted. **A cancelled `async_insert` is "outcome unknown": it may have fully committed, or may never have begun.** Retry through `async_upsert` on the same `content_hash` if you need the retry to be idempotent.
+- What *is* guaranteed: the outcome is all-or-nothing. The store is never left in a torn state.
+- Timing out does not make the work go away: the loop's shutdown (`asyncio.run` on the way out, or `loop.shutdown_default_executor()`) waits for the worker thread, so a process that exits right after a short timeout can still block for the rest of the in-flight call.
 
 ## Thread safety
 
@@ -163,6 +174,7 @@ What the contract does *not* cover:
 - **No cross-call atomicity.** A caller-side check-then-act sequence (`id_exists` then `delete_by_id`) can interleave with other writers. Batch writes are not atomic with respect to readers: a search overlapping an `upsert` can briefly see both the old and new generation of a `content_hash`.
 - **`save` serializes with writes** (so it always snapshots a consistent store); reads may proceed during a save.
 - **The embedder and reranker are invoked outside the store's lock** and must be thread-safe themselves.
+- **Two stores writing to the same path is safe.** Concurrent `save` calls to one destination from several threads each publish atomically and the last writer wins; a caller never sees a torn file, and never an error caused only by the other writer. Which writer wins is not defined.
 - **Multi-process access is not supported.**
 
 ## Known limitations

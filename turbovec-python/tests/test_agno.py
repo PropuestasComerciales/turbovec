@@ -1,6 +1,7 @@
 """Tests for the Agno VectorDb integration."""
 from __future__ import annotations
 
+import copy as _copy
 import json
 
 import numpy as np
@@ -914,6 +915,38 @@ def test_save_and_load_via_path_param(tmp_path):
     assert len(results) == 3
 
 
+@pytest.mark.parametrize("missing", ["docstore.json", "index.tvim"])
+def test_create_on_a_half_present_save_raises_instead_of_starting_empty(tmp_path, missing):
+    # Issue #328: create() swallowed _load_from's FileNotFoundError and
+    # built a fresh empty index, so a folder holding only one of the two
+    # artifacts loaded silently empty — and the next save() overwrote
+    # the surviving file, destroying the data permanently.
+    embedder = StubEmbedder()
+    db = TurboQuantVectorDb(embedder=embedder, path=str(tmp_path))
+    db.create()
+    db.insert("h", [_doc("a"), _doc("b"), _doc("c")])
+    db.save()
+    (tmp_path / missing).unlink()
+    survivor = "index.tvim" if missing == "docstore.json" else "docstore.json"
+    before = (tmp_path / survivor).read_bytes()
+
+    db2 = TurboQuantVectorDb(embedder=embedder, path=str(tmp_path))
+    with pytest.raises(FileNotFoundError) as exc:
+        db2.create()
+    assert "missing one of" in str(exc.value)
+    assert str(tmp_path) in str(exc.value)
+    # The surviving artifact is untouched, so the store is recoverable.
+    assert (tmp_path / survivor).read_bytes() == before
+
+
+def test_create_on_an_empty_folder_still_starts_fresh(tmp_path):
+    # The genuinely-fresh path — neither artifact present — must keep
+    # working; only a *partial* save is an error.
+    db = TurboQuantVectorDb(embedder=StubEmbedder(), path=str(tmp_path))
+    db.create()
+    assert len(db._index) == 0
+
+
 def test_failed_save_preserves_previous_store(tmp_path):
     # Regression test for #159: a save that fails mid-serialization
     # (non-JSON-serializable meta_data) must not destroy a previously
@@ -1009,6 +1042,40 @@ def test_load_rejects_side_car_with_extra_handle(tmp_path):
 
     with pytest.raises(ValueError, match="out of sync"):
         TurboQuantVectorDb(embedder=StubEmbedder(), path=str(tmp_path)).create()
+
+
+def test_failed_load_leaves_the_store_untouched(tmp_path):
+    # agno is the only integration whose load mutates a live store in
+    # place (the other three are classmethods returning a fresh object),
+    # so it is the only one that can leave a caller holding a half-loaded
+    # store. `check_persisted_handles` runs after the maps are rebuilt, so
+    # a desynced side-car used to raise *after* `_index` and every map had
+    # already been replaced: the store then reported `exists() is True`
+    # and a retried `create()` returned silently as "already created",
+    # handing back the corrupt half-load (#380).
+    db = TurboQuantVectorDb(embedder=StubEmbedder())
+    db.create()
+    db.insert("h", [_doc("a"), _doc("b")])
+    db.save(str(tmp_path))
+
+    with open(tmp_path / "docstore.json") as f:
+        state = json.load(f)
+    state["u64_to_doc"] = state["u64_to_doc"][1:]
+    with open(tmp_path / "docstore.json", "w") as f:
+        json.dump(state, f)
+
+    fresh = TurboQuantVectorDb(embedder=StubEmbedder(), path=str(tmp_path))
+    with pytest.raises(ValueError, match="out of sync"):
+        fresh.create()
+
+    assert not fresh.exists(), "a failed load left the store reporting itself as created"
+    assert fresh._u64_to_doc == {}, "a failed load left documents in the store"
+    assert fresh._str_to_u64 == {}
+    assert fresh._next_u64 == 0
+    # The concrete harm: with `_index` set, the retry is a silent no-op
+    # that hands back the half-load instead of re-raising.
+    with pytest.raises(ValueError, match="out of sync"):
+        fresh.create()
 
 
 # ---- Protocol coverage ----------------------------------------------------
@@ -1167,6 +1234,8 @@ def test_insert_filters_kwarg_merges_into_doc_metadata():
         _doc("b", doc_id="d2", meta_data={"existing": 2}),
     ]
     db.insert("h", docs, filters={"tenant": "acme", "tier": "pro"})
+    # Length first: this loop passes vacuously if insert stores nothing.
+    assert len(db._u64_to_doc) == 2
     for data in db._u64_to_doc.values():
         # Original meta_data preserved...
         assert "existing" in data["meta_data"]
@@ -1594,3 +1663,309 @@ def test_insert_batch_embedder_empty_vectors_raises_failed_to_embed():
     with pytest.raises(ValueError, match="failed to embed 2 document"):
         db.insert("h", [Document(content="a"), Document(content="b")])
     assert db.get_count() == 0
+
+
+def test_failed_insert_preserves_a_colliding_pre_existing_document(tmp_path):
+    # Issue #321: the maps-first write overwrites `_u64_to_doc[h]` when a
+    # corrupt watermark reissues a live handle. The unwind used to pop
+    # that slot unconditionally, destroying the VICTIM's payload while
+    # unlinking the NEW doc's id/name — violating the issue-#89 guarantee
+    # that a failed add never destroys existing data.
+    db = TurboQuantVectorDb(embedder=StubEmbedder(), path=str(tmp_path))
+    db.create()
+    db.insert("h1", [_doc("alpha", doc_id="A", name="A")])
+
+    before_docs = _copy.deepcopy(db._u64_to_doc)
+    before_ids = _copy.deepcopy(db._str_to_u64)
+    before_names = _copy.deepcopy(db._name_to_ids)
+    before_hashes = set(db._content_hashes)
+
+    # Rewind the watermark so the next handle collides with A's.
+    db._next_u64 = 0
+    victim_doc = _doc("beta", doc_id="B", name="B")
+    victim_doc.embedding = [float("nan")] * DIM
+    with pytest.raises(Exception):
+        db.insert("h2", [victim_doc])
+
+    # A is intact in every map, and the failed doc left nothing behind.
+    assert db._u64_to_doc == before_docs
+    assert db._str_to_u64 == before_ids
+    assert db._name_to_ids == before_names
+    assert db._content_hashes == before_hashes
+    assert db.get_count() == 1
+    assert len(db._index) == 1
+
+
+def test_failed_insert_without_collision_still_unwinds_cleanly(tmp_path):
+    # The non-colliding path (the common case) must be unaffected by the
+    # #321 restore.
+    db = TurboQuantVectorDb(embedder=StubEmbedder(), path=str(tmp_path))
+    db.create()
+    db.insert("h1", [_doc("alpha", doc_id="A", name="A")])
+    bad = _doc("beta", doc_id="B", name="B")
+    bad.embedding = [float("nan")] * DIM
+    with pytest.raises(Exception):
+        db.insert("h2", [bad])
+    assert db.get_count() == 1
+    assert "h2" not in db._content_hashes
+    assert "B" not in db._name_to_ids
+    assert len(db._u64_to_doc) == 1
+
+
+def test_load_rejects_a_rewound_next_u64_watermark(tmp_path):
+    # Issue #321 part 2: `check_persisted_handles` validated duplicates,
+    # count parity and membership, but never the watermark — so a stale
+    # or hand-edited side-car loaded cleanly and then bricked every
+    # subsequent write with "id N already present in index".
+    db = TurboQuantVectorDb(embedder=StubEmbedder(), path=str(tmp_path))
+    db.create()
+    db.insert("h1", [_doc("alpha", doc_id="A", name="A")])
+    db.save()
+
+    store_file = tmp_path / "docstore.json"
+    state = json.loads(store_file.read_text())
+    assert state["next_u64"] >= 1
+    state["next_u64"] = 0
+    store_file.write_text(json.dumps(state))
+
+    db2 = TurboQuantVectorDb(embedder=StubEmbedder(), path=str(tmp_path))
+    with pytest.raises(ValueError, match="next_u64"):
+        db2.create()
+
+
+def test_load_accepts_a_watermark_above_the_largest_handle(tmp_path):
+    # A watermark ahead of the handles is fine — it only skips ids.
+    db = TurboQuantVectorDb(embedder=StubEmbedder(), path=str(tmp_path))
+    db.create()
+    db.insert("h1", [_doc("alpha", doc_id="A", name="A")])
+    db.save()
+
+    store_file = tmp_path / "docstore.json"
+    state = json.loads(store_file.read_text())
+    state["next_u64"] = 10_000
+    store_file.write_text(json.dumps(state))
+
+    db2 = TurboQuantVectorDb(embedder=StubEmbedder(), path=str(tmp_path))
+    db2.create()
+    assert db2.get_count() == 1
+
+
+# ---------------------------------------------------------------------------
+# Contract divergences from agno's own semantics (#502, #503, #496)
+# ---------------------------------------------------------------------------
+
+
+def test_search_type_rejects_unsupported_values_at_runtime_not_just_init():
+    """agno's `Knowledge.search` assigns `vector_db.search_type` directly
+    before searching, without consulting `get_supported_search_types()`.
+    As a plain attribute that mutation succeeded silently and the store
+    served vector-only results for a hybrid request (#502)."""
+    db = TurboQuantVectorDb(embedder=StubEmbedder())
+    assert db.search_type == SearchType.vector
+
+    for bad in (SearchType.hybrid, SearchType.keyword):
+        with pytest.raises(ValueError, match="only supports search_type"):
+            db.search_type = bad
+        # And the attribute must not have been left misreporting.
+        assert db.search_type == SearchType.vector
+
+    # The supported value still assigns.
+    db.search_type = SearchType.vector
+    assert db.search_type == SearchType.vector
+
+
+def test_cosine_similarity_threshold_uses_raw_cosine():
+    """agno defines the cosine score as the raw cosine — `normalize_cosine`
+    is `1 - distance` and pgvector enforces `cos >= threshold`. Mapping
+    through `(cos + 1) / 2` admitted everything down to `2t - 1` (#503)."""
+    cos = TurboQuantVectorDb(embedder=StubEmbedder(), distance=Distance.cosine)
+    # Raw cosine passes straight through, clamped to [0, 1].
+    assert cos._scaled_similarity(0.90) == pytest.approx(0.90)
+    assert cos._scaled_similarity(0.80) == pytest.approx(0.80)
+    assert cos._scaled_similarity(-0.5) == 0.0
+    assert cos._scaled_similarity(1.2) == 1.0
+    # The old mapping would have scored cos=0.80 as 0.90 and let it past
+    # a 0.9 threshold.
+    assert cos._scaled_similarity(0.80) < 0.9
+
+    ip = TurboQuantVectorDb(
+        embedder=StubEmbedder(), distance=Distance.max_inner_product
+    )
+    # Inner product keeps agno's (ip + 1) / 2.
+    assert ip._scaled_similarity(0.80) == pytest.approx(0.90)
+    assert ip._scaled_similarity(0.0) == pytest.approx(0.5)
+
+
+def test_async_insert_does_not_embed_on_the_event_loop():
+    """With the default embedder (`enable_batch=False`) the async path used
+    to call the blocking sync embed on the loop thread, one document at a
+    time — stalling every other coroutine for the whole embed (#496)."""
+    import asyncio
+    import time
+
+    class SlowEmbedder(StubEmbedder):
+        enable_batch = False
+
+        def __init__(self, dim: int = DIM) -> None:
+            super().__init__(dim)
+            self.sync_calls = 0
+            self.async_calls = 0
+
+        def get_embedding(self, text: str) -> list[float]:
+            self.sync_calls += 1
+            time.sleep(0.02)
+            return self._embed(text)
+
+        def get_embedding_and_usage(self, text: str):
+            return self.get_embedding(text), None
+
+        async def async_get_embedding(self, text: str) -> list[float]:
+            self.async_calls += 1
+            await asyncio.sleep(0.02)
+            return self._embed(text)
+
+        async def async_get_embedding_and_usage(self, text: str):
+            return await self.async_get_embedding(text), None
+
+    async def run():
+        emb = SlowEmbedder()
+        db = TurboQuantVectorDb(embedder=emb)
+        db.create()
+        docs = [Document(content=f"doc-{i}") for i in range(10)]
+
+        gaps = []
+        stop = False
+
+        async def heartbeat():
+            last = time.perf_counter()
+            while not stop:
+                await asyncio.sleep(0.005)
+                now = time.perf_counter()
+                gaps.append(now - last)
+                last = now
+
+        hb = asyncio.create_task(heartbeat())
+        await db.async_insert("h", docs)
+        hb.cancel()
+        try:
+            await hb
+        except asyncio.CancelledError:
+            pass
+        return emb, max(gaps) if gaps else 0.0
+
+    emb, worst_gap = asyncio.run(run())
+    # 10 documents x 20 ms serial on the loop thread would be ~0.2 s; the
+    # loop must keep ticking far faster than that.
+    assert worst_gap < 0.1, f"event loop stalled for {worst_gap:.3f}s during async_insert"
+    assert emb.async_calls == 10, f"expected the async embed path, got {emb.async_calls}"
+    assert emb.sync_calls == 0, f"blocking embed ran on the loop ({emb.sync_calls} calls)"
+
+
+def test_async_insert_still_works_with_a_sync_only_embedder():
+    """The async path must not route a sync-only embedder into
+    `Document.async_embed`, which delegates to the base
+    `Embedder.async_get_embedding_and_usage` and raises
+    NotImplementedError. The capability test has to interrogate the
+    embedder, not the document — every agno Document defines
+    `async_embed`."""
+    import asyncio
+
+    class SyncOnlyEmbedder:
+        enable_batch = False
+
+        def __init__(self, dim: int = DIM) -> None:
+            self.dimensions = dim
+            self.calls = 0
+
+        def _embed(self, text: str) -> list[float]:
+            rng = np.random.default_rng(abs(hash(text)) % (2**32))
+            v = rng.standard_normal(self.dimensions).astype(np.float32)
+            v /= np.linalg.norm(v) + 1e-9
+            return v.tolist()
+
+        def get_embedding(self, text: str) -> list[float]:
+            self.calls += 1
+            return self._embed(text)
+
+        def get_embedding_and_usage(self, text: str):
+            return self.get_embedding(text), None
+
+    async def run():
+        emb = SyncOnlyEmbedder()
+        db = TurboQuantVectorDb(embedder=emb)
+        db.create()
+        await db.async_insert("h", [Document(content=f"d{i}") for i in range(4)])
+        return emb, db
+
+    emb, db = asyncio.run(run())
+    assert emb.calls == 4, f"sync embedder should have been used, got {emb.calls}"
+    assert db.get_count() == 4
+
+
+class CountingEmbedder(StubEmbedder):
+    """StubEmbedder that records how many times it was asked to embed.
+
+    A write into a store that never had create() called is doomed, so the
+    embedder — which may be a paid API call or GPU work — must not run
+    first (#473).
+    """
+
+    def __init__(self, dim: int = DIM) -> None:
+        super().__init__(dim)
+        self.calls = 0
+
+    def get_embedding(self, text: str) -> list[float]:
+        self.calls += 1
+        return super().get_embedding(text)
+
+    async def async_get_embedding(self, text: str) -> list[float]:
+        self.calls += 1
+        return await super().async_get_embedding(text)
+
+    # Agno's Document.embed goes through the *_and_usage surface, so the
+    # counter has to cover it too or an unfixed build never reaches the
+    # assertion.
+    def get_embedding_and_usage(self, text: str):
+        self.calls += 1
+        return self._embed(text), {"tokens": 1}
+
+    async def async_get_embedding_and_usage(self, text: str):
+        self.calls += 1
+        return self._embed(text), {"tokens": 1}
+
+
+def test_async_insert_before_create_does_not_embed():
+    import asyncio
+
+    emb = CountingEmbedder()
+    db = TurboQuantVectorDb(embedder=emb)
+    with pytest.raises(RuntimeError, match="not initialized"):
+        asyncio.run(db.async_insert("h", [_doc("a", pre_embed=False)]))
+    assert emb.calls == 0, "embedded a document for a write that could not succeed"
+
+
+def test_upsert_before_create_does_not_embed():
+    emb = CountingEmbedder()
+    db = TurboQuantVectorDb(embedder=emb)
+    with pytest.raises(RuntimeError, match="not initialized"):
+        db.upsert("h", [_doc("a", pre_embed=False)])
+    assert emb.calls == 0, "embedded a document for a write that could not succeed"
+
+
+def test_async_upsert_before_create_does_not_embed():
+    import asyncio
+
+    emb = CountingEmbedder()
+    db = TurboQuantVectorDb(embedder=emb)
+    with pytest.raises(RuntimeError, match="not initialized"):
+        asyncio.run(db.async_upsert("h", [_doc("a", pre_embed=False)]))
+    assert emb.calls == 0, "embedded a document for a write that could not succeed"
+
+
+def test_empty_writes_before_create_still_do_nothing():
+    """The guard must not turn a no-op into an error."""
+    import asyncio
+
+    db = TurboQuantVectorDb(embedder=CountingEmbedder())
+    db.insert("h", [])
+    asyncio.run(db.async_insert("h", []))

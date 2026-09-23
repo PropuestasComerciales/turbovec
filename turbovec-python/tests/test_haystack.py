@@ -356,6 +356,9 @@ def test_async_concurrent_embedding_retrievals_are_consistent():
         return [[d.id for d in r] for r in results]
 
     all_ids = asyncio.run(run())
+    # Length first: a loop over an empty (or short) list asserts nothing.
+    assert len(sync_ids) == 3
+    assert len(all_ids) == 10
     for ids in all_ids:
         assert ids == sync_ids
 
@@ -1033,6 +1036,8 @@ def test_scale_score_cosine_formula():
     results = store.embedding_retrieval(
         query_embedding=make_docs(3)[0].embedding, top_k=3, scale_score=True
     )
+    # Length first: a loop over an empty result list asserts nothing.
+    assert len(results) == 3
     # Cosine scores live in [-1, 1]; after (s+1)/2 they're in [0, 1].
     for doc in results:
         assert 0.0 <= doc.score <= 1.0
@@ -1046,6 +1051,8 @@ def test_scale_score_dot_product_formula():
     results = store.embedding_retrieval(
         query_embedding=make_docs(3)[0].embedding, top_k=3, scale_score=True
     )
+    # Length first: a loop over an empty result list asserts nothing.
+    assert len(results) == 3
     # expit(s/100) sigmoid is monotonically increasing on (-inf, inf) → (0, 1).
     for doc in results:
         assert 0.0 < doc.score < 1.0
@@ -1299,7 +1306,10 @@ def test_filter_documents_returns_documents_with_score_none():
     # embedding_retrieval — pin this so the invariant doesn't drift.
     store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
     store.write_documents(make_docs(3))
-    for doc in store.filter_documents():
+    fetched = store.filter_documents()
+    # Length first: a loop over an empty result list asserts nothing.
+    assert len(fetched) == 3
+    for doc in fetched:
         assert doc.score is None
 
 
@@ -1453,4 +1463,57 @@ def test_load_rejects_duplicate_document_ids_in_side_car(tmp_path):
         json.dump(state, f)
 
     with pytest.raises(ValueError, match="duplicate document ids"):
+        TurboQuantDocumentStore.load_from_disk(tmp_path)
+
+
+def test_embedding_retrieval_rejects_empty_query_embedding():
+    # Issue #301: the reference raises up front on an empty / non-numeric
+    # query embedding regardless of store contents; we used to return []
+    # on an empty store and give a dim-mismatch message otherwise.
+    store = TurboQuantDocumentStore(dim=DIM)
+    with pytest.raises(ValueError, match="non-empty list of floats"):
+        store.embedding_retrieval(query_embedding=[])
+
+    store.write_documents(make_docs(3))
+    with pytest.raises(ValueError, match="non-empty list of floats"):
+        store.embedding_retrieval(query_embedding=[])
+    with pytest.raises(ValueError, match="non-empty list of floats"):
+        store.embedding_retrieval(query_embedding=["not", "floats"])
+
+    # A well-formed embedding of the wrong dim still gets the dim message.
+    with pytest.raises(ValueError, match="does not match store dim"):
+        store.embedding_retrieval(query_embedding=[0.1] * (DIM + 1))
+
+    # Numpy scalars are accepted (the reference's isinstance(_, float)
+    # check would reject them).
+    got = store.embedding_retrieval(
+        query_embedding=np.asarray(unit_vector(0), dtype=np.float32), top_k=2
+    )
+    assert len(got) == 2
+
+
+def test_embedding_retrieval_async_rejects_empty_query_embedding():
+    import asyncio
+
+    store = TurboQuantDocumentStore(dim=DIM)
+    store.write_documents(make_docs(2))
+    with pytest.raises(ValueError, match="non-empty list of floats"):
+        asyncio.run(store.embedding_retrieval_async(query_embedding=[]))
+
+
+def test_load_from_disk_rejects_a_rewound_next_u64_watermark(tmp_path):
+    # Issue #321: shared `_persist` watermark check, haystack load path.
+    import json
+
+    store = TurboQuantDocumentStore(dim=DIM)
+    store.write_documents(make_docs(3))
+    store.save_to_disk(tmp_path)
+
+    side_car = tmp_path / "docstore.json"
+    state = json.loads(side_car.read_text())
+    assert state["next_u64"] >= 3
+    state["next_u64"] = 0
+    side_car.write_text(json.dumps(state))
+
+    with pytest.raises(ValueError, match="next_u64"):
         TurboQuantDocumentStore.load_from_disk(tmp_path)
