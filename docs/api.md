@@ -188,6 +188,86 @@ Common use cases:
 
 ---
 
+## Two-stage 2-bit search
+
+A 2-bit index of 32,768 vectors or more searches in two stages. Nothing changes on disk: the file is the same whichever way it is searched. `TURBOVEC_2BIT_PLANES=0` in the environment before the process first searches keeps the whole-index exact scan instead; it is read once per process.
+
+A 2-bit code is a sign bit and a magnitude bit per coordinate. The in-memory search cache holds the two bits apart — the same bytes per vector, arranged differently — and a search
+
+1. scans the sign bits alone (half the bytes of a full scan) for a shortlist of `max(128, 12.8 × k)` candidates,
+2. ranks the shortlist with an estimate that adds the magnitude bits (a bit-count against the query rounded to 6 bits per coordinate), and
+3. rescores the best `max(32, 2 × k)` with the exact scan's own arithmetic.
+
+**Scores are exact; the candidate set is approximate.** Every returned score is bit-identical to what the whole-index scan returns for that id. What can differ is *which* ids are returned: a vector whose sign bits alone rank it outside the shortlist is not seen. How often that happens depends on the data:
+
+| data | queries returning exactly the whole-index scan's ids |
+|---|---|
+| OpenAI `text-embedding-3` d=1536 and d=3072, N=200K, k = 1, 10, 100 | 99.99–100% of 10,000 |
+| `all-mpnet-base-v2` d=768, N=41K, k = 1, 10, 100 | 99.95–100% of 10,000 |
+| isotropic random unit vectors, d=64–1536, N=50K, k=10 | 4–7% (75% of ids shared) |
+
+Recall against float ground truth on the OpenAI corpora is unchanged at every k the benchmark suite reports. On random vectors — where a query has no real neighbours and the top-k is decided by noise-sized margins — the true nearest neighbour is in the top 10 for 74% of queries at d=768, against 86% with the whole-index scan. Check agreement on your own data if it is unlike the corpora above, and set `TURBOVEC_2BIT_PLANES=0` if the whole-index scan's id set is what you need.
+
+**When it is faster.** The first stage is cheaper than a full scan, and the later stages cost more as `k` grows, so the gain is largest for small `k`. Milliseconds per query on 100K OpenAI d=1536 vectors, 1,000 queries, whole-index scan → two-stage:
+
+| | k=10 | k=64 | k=100 |
+|---|---|---|---|
+| ARM (c4a), 1 thread, batch | 1.43 → 0.76 | 1.51 → 0.95 | 1.55 → 1.07 |
+| ARM (c4a), 1 thread, one query per call | 1.74 → 1.00 | 1.89 → 1.18 | 2.03 → 1.27 |
+| ARM (c4a), 8 threads, batch | 0.167 → 0.100 | 0.190 → 0.130 | 0.195 → 0.143 |
+| ARM (c4a), 8 threads, one query per call | 0.259 → 0.205 | 0.305 → 0.312 | 0.351 → 0.366 |
+| x86 (c3), 1 thread, batch | 0.55 → 0.39 | 0.62 → 0.57 | 0.68 → 0.68 |
+| x86 (c3), 1 thread, one query per call | 1.29 → 0.77 | 1.35 → 0.93 | 1.42 → 1.04 |
+| x86 (c3), 8 threads, batch | 0.137 → 0.096 | 0.161 → 0.137 | 0.183 → 0.174 |
+| x86 (c3), 8 threads, one query per call | 0.397 → 0.286 | 0.450 → 0.439 | 0.538 → 0.507 |
+
+Through `k=100` every cell is faster or within 4% of the whole-index scan; the cells at parity are multi-threaded single queries and x86 batches at the largest `k`.
+
+**What scans the whole index instead.** Indexes below 32,768 vectors (an index that grows past the threshold switches then, and keeps the layout if it later shrinks); dimensions that are not a multiple of 32; x86 CPUs without AVX-512 VBMI and VNNI. Filtered searches use the two-stage path with a plain top-shortlist heap.
+
+---
+
+## Staged 4-bit search
+
+A 4-bit index of 32,768 vectors or more searches in stages. Nothing changes on disk: the file is the same whichever way it is searched. `TURBOVEC_4BIT_PLANES=0` in the environment before the process first searches keeps the whole-index exact scan instead; it is read once per process.
+
+A 4-bit code is a sign bit and three lower bits per coordinate. The in-memory search cache holds the four bit planes apart — the same bytes per vector, arranged differently — and a search
+
+1. scans the sign bits alone (a quarter of the bytes of a full scan) for a shortlist of `max(256, 20 × k)` candidates (`16 × k` from `k = 64`),
+2. ranks the shortlist with an estimate that adds the next bit plane and keeps the best `max(96, 6 × k)`,
+3. ranks those with all three lower planes, and
+4. rescores the best `max(32, 1.5 × k)` with the exact scan's own arithmetic.
+
+**Scores are exact; the candidate set is approximate.** Every returned score is bit-identical to what the whole-index scan returns for that id. What can differ is *which* ids are returned: a vector whose sign bits alone rank it outside the shortlist is not seen. On the corpora below the first stage keeps a wide margin:
+
+| data | queries returning exactly the whole-index scan's ids |
+|---|---|
+| OpenAI `text-embedding-3` d=1536 and d=3072, N=200K, k = 1, 10, 100 | 99.98–100% of 10,000 |
+| `all-mpnet-base-v2` d=768, N=41K, k = 1, 10, 100 | 99.92–100% of 10,000 |
+
+Recall against float ground truth on the OpenAI corpora is unchanged at every k the benchmark suite reports. Structureless random vectors are a different matter: with no real neighbours, a shortlist of sign bits misses the exact top-k for most queries. Check agreement on your own data if it is unlike the corpora above, and set `TURBOVEC_4BIT_PLANES=0` if the whole-index scan's id set is what you need.
+
+**How much faster.** Milliseconds per query on 100K OpenAI d=1536 vectors, whole-index scan → staged; batches are 1,000 queries in one call:
+
+| | k=10 | k=32 | k=64 | k=100 |
+|---|---|---|---|---|
+| ARM (c4a), 1 thread, batch | 0.985 → 0.741 | 1.012 → 0.800 | 1.052 → 0.872 | 1.105 → 0.956 |
+| ARM (c4a), 1 thread, one query per call | 3.58 → 0.95 | 3.62 → 1.01 | 3.70 → 1.09 | 3.86 → 1.19 |
+| ARM (c4a), 8 threads, batch | 0.111 → 0.094 | 0.126 → 0.101 | 0.135 → 0.112 | 0.133 → 0.123 |
+| ARM (c4a), 8 threads, one query per call | 0.506 → 0.179 | 0.514 → 0.214 | 0.553 → 0.235 | 0.606 → 0.270 |
+| x86 (c3), 1 thread, batch | 0.639 → 0.348 | 0.659 → 0.419 | 0.701 → 0.509 | 0.765 → 0.609 |
+| x86 (c3), 1 thread, one query per call | 3.34 → 0.73 | 3.35 → 0.82 | 3.45 → 0.92 | 3.47 → 0.96 |
+| x86 (c3), 8 threads, batch | 0.155 → 0.087 | 0.162 → 0.099 | 0.175 → 0.117 | 0.199 → 0.142 |
+| x86 (c3), 8 threads, one query per call | 0.999 → 0.303 | 1.010 → 0.327 | 1.066 → 0.401 | 1.137 → 0.470 |
+
+Every cell is faster: one query per call 2.25x–4.57x, batches 1.09x–1.84x (harmonic mean over the 32 cells 1.87x). A single query is where the full 4-bit scan is dearest, so that is where the staged search gains most; a batch already shares each block's bytes across queries, so its gain is the quarter-width first stage alone, and it shrinks as `k` grows. On 100K OpenAI d=3072 the same cells read 1.10x–5.65x (harmonic mean 1.83x on ARM, 2.27x on x86).
+
+**Small indexes.** The shortlist is sized by `k`, not by the index, so on an index of 40K vectors a `k=100` shortlist is 4% of it and the ranking stages cost a batch more than the shorter scan saves: measured on 40K vectors (OpenAI d=1536 cut down, and all-mpnet-base-v2 d=768 at 41K), batches at `k=100` run 0.80x–1.04x and at `k=64` 0.88x–1.15x of the whole-index scan, while every other cell is faster (one query per call 1.3x–3.7x; harmonic mean 1.3x–1.5x over the 16 cells). From about 64K vectors every cell is ahead.
+
+**What scans the whole index instead.** Indexes below 32,768 vectors (an index that grows past the threshold switches then, and keeps the layout if it later shrinks); dimensions that are not a multiple of 32; x86 CPUs without AVX-512 VBMI and VNNI. Filtered searches use the staged path with a plain top-shortlist heap.
+
+---
+
 ## File formats
 
 ### `.tv` — `TurboQuantIndex`
@@ -243,6 +323,35 @@ suggest.
 
 On load, the reverse `id → slot` map is rebuilt in memory. Duplicate ids in the `slot_to_id` table are rejected as corrupt.
 
+### The v8 container
+
+What `write()`, `to_bytes()` and `sync()` produce today is the v8 container (magic `TV8\0`), the v7 container with one more superblock byte:
+
+```
+┌───────────────────────────────────────────┐
+│ superblock                                │
+│   magic     "TV8\0"                       │
+│   revision  u8 = 1                        │
+│   bit_width u8 · kind u8 (0 .tv, 1 .tvim) │
+│   layout    u8 — 0 sequential, 1 planes   │
+│   dim u32 · nonce u64 · ops capacity u32  │
+│   codebook, TQ+ calibration, CRC          │
+├───────────────────────────────────────────┤
+│ header slot A │ header slot B  (alternate │
+│   commits: generation, n, the partial     │
+│   tail block's rows, pending redo ops,    │
+│   delta digest, CRC)                      │
+├───────────────────────────────────────────┤
+│ block units — one per whole 32-row block  │
+│   codes in `layout`, 32 scales, 32 ids    │
+│   (.tvim)                                 │
+└───────────────────────────────────────────┘
+```
+
+A unit's codes are the block's sequential-blocked rows (`layout` 0, as every v7 unit) or its bit planes (`layout` 1): the sign plane first, one byte per group of eight coordinates for each of the 32 rows, group-major, then the 32 rows' lower planes, least significant first. The two forms are the same number of bytes, so every offset in the file is the same whichever a unit holds. An index of 32,768 vectors or more keeps its search cache as bit planes (see the two-stage and staged searches above), and writes `layout` 1; smaller indexes, 3-bit indexes and dimensions that are not a multiple of 32 write `layout` 0. Either loads anywhere: a planes file on a host that scans the whole index (x86 without AVX-512, or under `TURBOVEC_*BIT_PLANES=0`) converts on load, as a sequential file converts to planes on a host that uses them. The planes form is arch-neutral; x86 permutes the sign bytes in place at load.
+
+A `sync()` into a v7 file rewrites it as v8 once, as it would for a calibration change, and continues incrementally from there.
+
 ### In-memory serialization
 
 Both index types (de)serialize their wire format in memory, without a filesystem round-trip:
@@ -290,7 +399,7 @@ A loaded index stays bound to the path it came from, so it keeps syncing forward
 
 ### Load performance
 
-The file stores the codes in the arch-neutral *sequential blocked* layout the search kernels consume, plus the Lloyd-Max codebook, so a load seeds the search caches directly: there is no O(n·dim) repack and no codebook solve on first search. Non-x86 uses the stored layout as-is; x86 applies one cheap in-block nibble interleave at load (a threaded SIMD pass, ~2 ms for a 77 MB index). The rotation is deterministic and rebuilt from `dim` in well under a millisecond. A stored index survives cross-platform load → re-save byte-identically; the format itself adds no platform dependence.
+The file stores the codes in the layout the search kernels consume — the arch-neutral sequential blocked rows, or, for an index of 32,768 vectors or more, its bit planes — plus the Lloyd-Max codebook, so a load seeds the search caches directly: there is no O(n·dim) repack and no codebook solve on first search. Non-x86 uses the stored layout as-is; x86 applies one cheap in-block permutation at load (a threaded pass, a few milliseconds for a 77 MB index). A v7 file, which holds the sequential rows only, converts to the planes on load (block-parallel; ~20 ms for 100K × 1536 at 4 bits with the pool, ~80 ms on one thread) and is rewritten as v8 by its next `sync()`. The rotation is deterministic and rebuilt from `dim` in well under a millisecond. A stored index survives cross-platform load → re-save byte-identically; the format itself adds no platform dependence.
 
 ### Versioning and limits
 
@@ -302,8 +411,8 @@ Measured by flipping every one of the 32,912 bits of a 4114-byte `.tv` file in t
 
 This is a deliberate scope choice, not an oversight. A save is atomic and a crash mid-write leaves the previous file intact, so the writer cannot leave a torn index behind; what is out of scope is damage that arrives afterwards. If you need to detect that, checksum the file yourself or store it on a filesystem that does.
 
-`n_calib = 0` in the TQ+ trailer means an uncalibrated index; otherwise it equals `dim`. Only v7 is read: a v5 or v6 file is refused with an error naming its version, and `turbovec::convert` moves a file between v5, v6 and v7 in either direction (`cargo run --example convert -- <in> <out> v7`). Versions 1 through 4 predate the v5 rotation change and cannot be decoded at all — their codes were encoded under a rotation this build cannot reproduce — so they must be rebuilt from the source vectors.
+`n_calib = 0` in the TQ+ trailer means an uncalibrated index; otherwise it equals `dim`. v7 and v8 are read: a v5 or v6 file is refused with an error naming its version, and `turbovec::convert` moves a file between v5, v6, v7 and v8 in any direction (`cargo run --example convert -- <in> <out> v8`); converting a v8 planes file down re-containers the same codes, never re-quantizes. Versions 1 through 4 predate the v5 rotation change and cannot be decoded at all — their codes were encoded under a rotation this build cannot reproduce — so they must be rebuilt from the source vectors.
 
 `dim = 0` in the core header signals a lazy uncommitted index. It is only valid alongside `n_vectors = 0`; on load it produces an index whose `dim` is `None` until the first `add` / `add_with_ids` call.
 
-Both formats carry a magic + version byte and are stable across minor versions. Breaking changes bump the version byte. `write()`, `to_bytes()` and `sync()` all produce v7: `write()` and `to_bytes()` an *unclaimed* snapshot, `sync()` a container it claims and then updates incrementally (see [Incremental saves](#incremental-saves--sync)). v7 files are not readable by earlier turbovec releases, whose loaders reject the version byte rather than misparse it; `turbovec::convert` writes a v5 or v6 file for one.
+Both formats carry a magic + version byte and are stable across minor versions. Breaking changes bump the version byte. `write()`, `to_bytes()` and `sync()` all produce v8: `write()` and `to_bytes()` an *unclaimed* snapshot, `sync()` a container it claims and then updates incrementally (see [Incremental saves](#incremental-saves--sync)). v8 files are not readable by earlier turbovec releases, whose loaders reject the magic rather than misparse it; `turbovec::convert` writes a v7, v6 or v5 file for one.

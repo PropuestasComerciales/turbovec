@@ -2930,3 +2930,3152 @@ effect on the arm nq=100 MT cell, direction consistent with H39 and H48,
 worth a proper soak by anyone who wants to spend one.
 
 **Verdict: non-win 25/25.**
+
+---
+
+# Round 2 — reopened 2026-09-06 at main 1.0.0 (ccab9f32)
+
+Round 1 closed at 25 consecutive non-wins on 2026-08-08 and shipped as #511
+(five wins, 8-cell HM x1.0495). Main has since moved: format v7 (#535/#536),
+five release-blocking fixes (#533), and a whole-block prune on the aarch64
+nq=1 block-parallel path (#493) that touches an objective cell directly. The
+round-1 baseline is therefore stale and is re-pinned at this HEAD before
+anything is measured. Same eight cells, same harness, same authority
+(`whm_2bit.py`), non-win count restarts at 0/20 per `GOAL_2bit.md`.
+
+Branch `perf/2bit-hillclimb-2`, worktree `~/git/tv-2bit-hc`.
+
+**Protocol carried over from round 1, stated up front this time:**
+
+- Control run first. P34/P35 found the smoke's no-op band is per-cell —
+  0.2% `nq1_st`, 1.4% `nq1_mt`, 1.1% `nq100_st`, 0.1% `nq100_mt` on arm —
+  and that a wide band means mode-switching, not sampling. A byte-identical
+  binary is run A/B against itself on both boxes before the first candidate.
+- Rebuild the box to baseline after every candidate (round-1 correction 2).
+- `rm -rf target` before every release build; LD_PRELOAD the arch libopenblas.
+- Prebuilt `.so` files per label, balanced ABBA passes, min per label.
+
+**Opening candidates, in order:**
+
+1. H51 — `TILES_PER_THREAD_NEON` 64 -> 32, the one candidate round 1 left
+   open (H50: `nq100_mt` x1.0033 at 3.3x band, never soaked).
+2. The #493 prune on the arm nq=1 path: it was added for a gate-crossing
+   case at nq=1 and measured neutral in H116 at the old geometry; re-measure
+   at the 2-bit cells, since it sits on `nq1_st` and `nq1_mt` directly.
+3. Width-invariant constants — the round-1 lesson (H14, H41): any constant
+   swept at 4 bits and inherited at 2 is a candidate. `FLUSH_EVERY` is done;
+   the remaining ones are catalogued before the first build.
+
+## Rig status
+
+Blocked at open: gcloud's auth token expired, and both boxes are reached
+through an IAP tunnel (`ProxyCommand gcloud compute start-iap-tunnel`), so
+`ssh tvarm` / `ssh tvx86` fail until `gcloud auth login` is re-run
+interactively. Local (M3 Max) is not an objective cell and is used only to
+check that the harness still runs against the v7 build.
+
+## Local pre-screen calibration (M3 Max, not an objective cell)
+
+While the rig is down, the laptop is used to screen aarch64 candidates. Its
+no-op band, byte-identical binary ABBA, min of 3 sub-runs per pass:
+
+| cell | ctl | ctl2 | band |
+|---|---|---|---|
+| nq100_mt | 9.843 | 9.595 | **2.6%** |
+| nq1_mt | 0.317 | 0.327 | **2.8%** |
+| nq100_st | 98.433 | 98.547 | 0.1% |
+| nq1_st | 1.195 | 1.196 | 0.05% |
+
+The MT cells are unresolvable here below ~3% (E-cores and scheduler jitter);
+the ST cells resolve at 0.1%. So the laptop can screen ST-path candidates and
+cannot screen MT-only ones. Nothing measured here is a verdict — verdicts
+come from the two boxes through `whm_2bit.py`.
+
+## H51 — `TILES_PER_THREAD_NEON` 64 -> 32 (round-1 H50) — local pre-screen UNRESOLVED
+
+2-pass ABBA, min per label: nq100_mt x1.0073, nq1_mt x0.9885, nq100_st
+x1.0002, nq1_st x1.0068. Both MT cells sit inside the 2.6-2.8% local band;
+both ST cells are untouched by construction (ST has one range). Consistent
+with round 1's +0.33% on the Axion box and no more informative than that.
+**Queued for the rig soak; no verdict.**
+
+## H52 — the #493 whole-block prune on the arm nq=1 path, ablated — REFUTED as a lever (local pre-screen)
+
+Main added a whole-block prune to `scan_range_neon`'s lane loop after round 1
+closed (#493), on a cell this climb scores directly. Round 1's H116 had
+measured the same prune neutral at 4 bits. Ablated with `if false &&` at the
+prune's guard so the block-max tree compiles out; binaries differ
+(`5fc546dd` vs `1fad8892`). ST-only ABBA on the laptop, where the ST band is
+0.1%:
+
+| cell | ctl | prune off | |
+|---|---|---|---|
+| nq1_st | 1.173 | 1.269 | **x0.924** |
+| nq100_st | 98.341 | 98.409 | x0.999 (untouched path) |
+
+**The prune is worth 7.6% at 2 bits on this cell**, not the "neutral" H116
+recorded at 4 bits — at half the bytes per vector the lane loop is a larger
+share of the block, so skipping it matters more. It is already in the
+baseline, so there is nothing to win here; the value is knowing the lever is
+live at 2 bits and pointing the same direction as the arm nq=1 gap.
+**Not a candidate; not counted.** (Ablations and probes that do not propose a
+change are recorded but do not consume the non-win count, per round 1's
+convention for P-entries.)
+
+## H53 — const-generic batch width for the x86 2-bit VNNI kernel — PRE-REGISTERED
+
+Found by reading the shipped machine code rather than the source.
+`search_multi_query_vnni` takes `nq` at runtime and loops
+`for qi in 0..nq.min(8)` over `acc: [[__m512i; 2]; 8]` and
+`split_luts[qi]`. LLVM unrolls that loop to 8, but it cannot delete the
+trip-count test or the slice bounds check, so the shipped inner body per
+quad-half is:
+
+```
+vpermb (%rdx,%rcx,1),%zmm17,%zmm18
+vpdpbusd %zmm20,%zmm18,%zmm1
+vpermb 0x40(%rdx,%rcx,1),%zmm16,%zmm18
+vpdpbusd %zmm20,%zmm18,%zmm1
+cmp $0x1,%r8 ; je ...        <- nq.min(8) exit test
+cmp $0x1,%rdi ; je ...       <- split_luts.len() bounds check
+... x8 queries ...
+vmovdqa64 %zmm6,0x280(%rsp)  <- accumulators for queries 5-8 spilled per quad
+```
+
+Per quad at nq=8 that is 32 vpermb + 32 vpdpbusd (the work) plus 32
+compare-and-branch pairs and ~8 zmm stores (the overhead). On Sapphire
+Rapids vpermb is p5-only and vpdpbusd zmm is p0-only, so the work alone is
+32 cycles a quad on each port; the fused branches land on p0/p6 and the
+stores on p4/p9, so the overhead is not free and sits on the same critical
+port as the dot products. P7 priced the shipped ST cell 17% under the P6
+probe — a probe whose loop had a constant width — and attributed the gap to
+"probe idealization". This is a concrete candidate for part of that gap.
+
+Change: `NQ` becomes a const generic; the dispatch picks `<4>` for a tail
+of <= 4 queries and `<8>` otherwise (the driver already pads `split_luts`
+to the batch width). LUT pointers, scales and biases are copied into
+`[_; NQ]` locals up front so every hot-loop access is a constant index.
+Accumulation order per query is unchanged, so scores are bit-identical.
+Pad queries in a narrow tail are scored into registers and skipped at the
+heap update.
+
+Prediction: x86 nq100_st and nq100_mt improve; nq=1 untouched (separate
+kernel); arm untouched by construction. `cargo check --target
+x86_64-unknown-linux-gnu` clean. Patch staged as `~/hc/h53.patch` on the
+x86 box, to run after the baseline pin.
+
+## Round-2 baseline — commit ccab9f32 (main 1.0.0), pinned 2026-09-06
+
+Both boxes: `git reset --hard ccab9f32`, `rm -rf target`, `maturin develop
+--release` (51 crates compiled — a clean build, verified), old `.tvim`
+caches deleted so the seeded index is rebuilt in the v7 format, arch
+libopenblas LD_PRELOADed, one process per cell. Three rounds of
+`cells_2bit.py` (each cell min of 9 sub-runs); the pin is the per-cell min
+across rounds. Files: `data/r2_base_{arm,x86}.json` (with all raw samples),
+rounds in `data/r2_base_{arm,x86}_r{1,2,3}.json`.
+
+| cell | arm ms | arm round spread | x86 ms | x86 round spread |
+|---|---|---|---|---|
+| nq1_st | **1.650** | 2.6% | **1.533** | 24.2% |
+| nq1_mt | **0.263** | 5.5% | **0.427** | 4.2% |
+| nq100_st | **134.453** | 4.3% | **85.802** | 1.3% |
+| nq100_mt | **17.217** | 0.7% | **24.013** | 2.8% |
+
+Against the round-1 pin (262793f) every arm cell is faster (nq1_st 1.995
+-> 1.650, nq100_st 148.99 -> 134.45, nq100_mt 18.43 -> 17.22): that is the
+five round-1 wins plus #493's prune, as expected. x86 nq100_st 83.1 -> 85.8
+and nq100_mt 25.5 -> 24.0 are inside their bands of the H41 capstone. **x86
+nq1_st is bimodal across processes again** — rounds read 1.533 / 1.903 /
+1.90 with min-of-9 inside each — so that cell's pin is the fast mode and a
+candidate must reach the fast mode to tie it. The x86 nq=1 control smoke
+below shows the same 9% band on an unchanged binary.
+
+**Control bands (byte-identical `base2.so` vs `ctl2.so`, 2-pass ABBA smoke,
+min per label):**
+
+| cell | arm | x86 |
+|---|---|---|
+| nq100_st | 0.6% | 0.2% |
+| nq100_mt | 0.6% | 0.4% |
+| nq1_st | 0.2% | **8.8%** |
+| nq1_mt | 1.9% | 0.7% |
+
+Parity digests (2-bit / 4-bit) recorded in `data/r2_parity_{arm,x86}.json`;
+the 2-bit digests differ between arches, as they did in round 1 (the x86
+VNNI kernel rounds once at the end, the arm classic kernel flushes), and the
+gate is per-arch against these.
+
+Non-win count: 0/20.
+
+## H51 — `TILES_PER_THREAD_NEON` 64 -> 32 on the rig — REFUTED (non-win 1/20)
+
+Axion, 2-pass ABBA smoke vs `base2`, min per label:
+
+```
+base2  nq100_mt 17.281  nq1_mt 0.265  nq100_st 137.465
+h51    nq100_mt 17.341  nq1_mt 0.273  nq100_st 135.755
+h51    nq100_mt 17.360  nq1_mt 0.269  nq100_st 136.254
+base2  nq100_mt 17.368  nq1_mt 0.269  nq100_st 135.579
+```
+
+nq100_mt x0.997 (band 0.6%), nq1_mt x0.985 (band 1.9%), nq100_st x1.000
+(one range at ST; untouched by construction). Round 1's +0.33% does not
+reproduce at 1.0.0; the candidate it left open is closed. Reverted.
+
+**Verdict: non-win 1/20.**
+
+## H53 — smoke, x86 (Sapphire Rapids), 2-pass ABBA vs `base2`
+
+```
+base2  nq100_st 86.662  nq100_mt 24.636
+h53    nq100_st 70.405  nq100_mt 19.356
+h53    nq100_st 70.312  nq100_mt 18.797
+base2  nq100_st 86.039  nq100_mt 24.296
+```
+
+**nq100_st x1.224, nq100_mt x1.293**, against control bands of 0.2% and
+0.4%. Every candidate sample is below every control sample by a wide
+margin. Built incrementally from ccab9f32 + `h53.patch` (`acb2f8a5`),
+HEAD verified before and after. Promoted to soak: 3 balanced ABBA passes
+of the full harness, paired nq/N sweep, 4-bit observation, `cargo test`.
+Arm: the patch is entirely inside `cfg(target_arch = "x86_64")` code, so
+the arm binary is expected byte-identical; checked by building it there.
+
+**Arm identity check for H53.** The arm `h53.so` hash differs from `base2.so`
+(`c6d2ff3f` vs `164dbd79`), but so does any source change: the crate hash
+feeds every mangled symbol, so a patch inside `cfg(x86_64)` still renames
+symbols on aarch64. An unpatched incremental build (`ctl3`) reproduces
+`base2` byte for byte, so the build is deterministic and the difference is
+the patch. Symbol-blind disassembly (addresses, symbol hashes and immediates
+normalised): 198,007 instruction lines each, **zero differing instructions**.
+The arm kernel is the same code, so the arm cells enter the verdict at
+x1.000 from the pinned baseline rather than being re-measured.
+
+## H53 — soak, gates and verdict on the first cut
+
+**Soak** (x86, 3 balanced ABBA passes of the full harness, prebuilt `.so`
+swapped per pass, min per label; files `data/r2_h53/`):
+
+| cell | base2 | h53 | |
+|---|---|---|---|
+| nq100_st | 85.340 | 68.486 | **x1.2461** |
+| nq100_mt | 24.140 | 18.689 | **x1.2917** |
+| nq1_st | 1.276 | 1.277 | x0.9995 |
+| nq1_mt | 0.423 | 0.426 | x0.9928 (band 0.7%) |
+
+Every h53 pass on both nq=100 cells is below every base2 pass (ST
+68.5-69.8 against 85.3-86.6; MT 18.7-19.0 against 24.1-24.7). The nq=1
+cells are the separate single-query kernel and read as drift.
+
+**Gates.** Parity digests identical to `base2` at both widths
+(`d8ce9ea9…` / `3314955a…`). `cargo test -p turbovec` green on the x86 box
+(all suites, 141 in the main one) and on the arm laptop with the patch
+applied (10 suites). Arm binary instruction-identical (above).
+
+**`whm_2bit.py` against the pinned baseline** (arm cells x1.0000 by
+identity):
+
+```
+cell            arm        x86
+  nq1_st       x1.0000    x1.2010   <- bimodal cell; not claimed
+  nq1_mt       x1.0000    x1.0008
+  nq100_st     x1.0000    x1.2528
+  nq100_mt     x1.0000    x1.2849
+  x86 4-cell HM  x1.1736
+  8-cell HM      x1.0799   worst cell x1.0000
+```
+
+Against the in-soak paired base2 (the drift-cancelling reading):
+x86 4-cell HM x1.1159, 8-cell HM **x1.0548**, worst cell nq1_mt_x86
+x0.9928, VERDICT: WIN. The pinned reading's x1.20 on nq1_st is the
+bimodal cell drawing its slow mode for the pin and its fast mode in the
+soak; the paired reading (x0.9995) is the honest one for that cell, and
+the 8-cell HM clears x1.01 by a factor of five either way.
+
+**4-bit observation** (never gated): recorded in
+`data/r2_h53/h53_obs4_*.json`; the 4-bit path is the permute-dot kernel
+and does not touch this code.
+
+**Sweep — and this is why the gate exists.** Paired A/B, 44 points, all
+measured (`data/r2_h53/h53_sweep.json`, ratio > 1 means the candidate is
+faster):
+
+| point | ST | MT |
+|---|---|---|
+| nq=2 | **x0.864** | x0.968 |
+| nq=3 | x1.127 | x1.085 |
+| nq=4 | x1.169 | x1.295 |
+| nq=5 | **x0.882** | **x0.929** |
+| nq=6 | x1.032 | x1.080 |
+| nq=7 | x1.162 | x1.175 |
+| nq=8..64 | x1.12-x1.41 | x1.14-x1.35 |
+| N=1k..200k (nq=100) | x1.03-x1.24 | x1.07-x1.30 |
+
+nq=2 and nq=5 regress 12-14%, far outside P4's 3% noise, and the mechanism
+is exactly the shape of the first cut: a batch narrower than the
+instantiation is padded up to it, so nq=2 does four queries' work and nq=5
+does eight. At nq=3/6/7 the branch-free loop outruns the padding; at 2 and
+5 it does not. **Not promoted in this form.** H53b instantiates every width
+2..=8 so no batch does padded work; the nq=100 cells are unaffected by
+construction (100 = 12x8 + 4, both exact already), so the soak above stands
+for them and H53b needs only its own smoke, parity and sweep.
+
+Harness note: the sweep driver segfaulted *after* writing all 44 points.
+It had imported turbovec itself to rebuild the small-N indexes (deleted for
+the v7 re-pin) and then overwrote the mapped `.so` in place for the A/B
+swaps; the crash is the interpreter tearing down a module whose file
+changed under it. Round 1 never hit this because its small-N indexes were
+already cached. The H53b sweep runs with the indexes present and should not
+reproduce it; if it does, the harness gets a fix, not the candidate.
+
+## H53b — one instantiation per width 2..=8 — gates
+
+Built incrementally from ccab9f32 + `h53b.patch` (`2c56e476`). Smoke
+against `h53` on the objective cells: nq100_st 70.22 vs 70.16 (x0.999),
+nq100_mt 18.34 vs 18.99 (x1.035) — the same code on the nq=100 path, as
+predicted (the MT figure is the bimodal side of that cell drawing
+differently; the soak decides). Smoke against `base2`: nq100_st x1.221,
+nq100_mt x1.30, nq1 cells inside band.
+
+Parity digests identical to `base2` at both widths. Arm build
+instruction-identical to the control (symbol-blind diff: 0 instructions).
+Local `cargo test -p turbovec` with the patch: 40 suites green.
+
+**Sweep, paired A/B, 44 points, no segfault this time** (the small-N
+indexes were cached, which confirms the harness reading above):
+
+| point | ST | MT |
+|---|---|---|
+| nq=2 | **x1.236** | x1.188 |
+| nq=3 | x1.225 | — |
+| nq=5 | **x1.328** | x1.298 |
+| nq=6 | x1.411 | — |
+| nq=7 | x1.311 | — |
+| nq=8 / 16 / 64 | x1.304 / x1.293 / x1.243 | — |
+| N=1k / 8k / 32k / 200k (nq=100) | x1.035 / x1.146 / x1.231 / x1.233 | 200k: x1.348 |
+
+**No point below 0.97; the worst is nq1_mt at x0.995**, which is the
+single-query kernel and noise. The two padding regressions of the first
+cut are now the two largest ST gains in the nq sweep. Soak launched (3
+balanced ABBA passes); the verdict is the soak through `whm_2bit.py`.
+
+## H54 — range-major block tiling for the single-thread scan — PRE-REGISTERED
+
+`n_block_ranges` returns 1 whenever the pool has one thread, by design
+("identical work and visit order to the serial scan"). So at ST every
+query batch sweeps the whole 38 MB of codes: 13 sweeps at nq=100 on x86
+(batch 8), 25 on arm (batch 4). P26 priced the DRAM term of the 2-bit scan
+at 12.5% of the loop at N=200k for nq=1; at nq=100 the compute per byte is
+higher and the term smaller, but it is paid on every sweep. The MT path
+already tiles (query-quad x block-range) and its tile order is range-major
+with quads inner, and the cross-range merge is deterministic (score desc,
+index asc), so a one-thread pool can take the same tiles with no change to
+results.
+
+Change: with one thread and more than one quad, split the block axis into
+ranges of `ST_RANGE_BLOCKS = 256` blocks (1.5 MB of 2-bit codes, L2-resident
+on both rig cores), capped by `range_cap_for_k`. Untouched: nq=1 (one
+quad), MT, masked and scalar paths. Prediction: nq100_st improves on both
+arches; other cells unchanged. Parity must hold by the merge's
+determinism. The 4-bit observation may move either way (3 MB ranges).
+
+## H55 — VNNI batch width 10 — PRE-REGISTERED (x86, on top of H53b)
+
+With the width const-generic, 10 queries fit the register file (20 zmm of
+accumulators + 8 temporaries) where 12 would spill. nq=100 becomes ten
+sweeps of the codes instead of thirteen, and the per-quad shared decode
+(2 loads, and/shift/or) amortises over 10 queries. Risk: the batch's LUT
+set grows from 48 KB to 60 KB, past L1D (48 KB on Sapphire Rapids), so
+`vpermb`'s table operands come from L2 more often. Round 1's H12 refuted
+the analogous 4 -> 8 widening on arm as L1-bound; this is the x86 version
+of the same question, and the answer is measured, not argued. Instantiation
+arms added for widths 9 and 10; `nq_batch` becomes 10 for the VNNI path
+when that reduces the batch count.
+
+## H54 — range-major ST tiling — REFUTED on arm (non-win 2/20)
+
+Axion, 2-pass ABBA smoke vs `base2`, min per label:
+
+```
+base2  nq100_st 132.761  nq1_st 1.643  nq100_mt 17.147
+h54    nq100_st 140.351  nq1_st 1.636  nq100_mt 17.016
+h54    nq100_st 140.137  nq1_st 1.653  nq100_mt 17.202
+base2  nq100_st 132.460  nq1_st 1.659  nq100_mt 17.271
+```
+
+**nq100_st x0.945** — every candidate sample above every control sample,
+against a 0.6% band. nq1_st and nq100_mt flat, as the patch predicts
+(untouched paths). The L2-residency the change buys is real but smaller
+than what it costs: 25 ranges means every query's top-k is re-filled from
+empty 25 times, and the fill phase runs without the whole-block prune that
+makes the steady state cheap. The MT path pays the same per-range cost but
+spreads it over eight workers that would otherwise idle; one worker has no
+such offset. Round 1's note that "the per-range top-k duplication is
+exactly the cost the k cap argued for" applies with full force at ST.
+
+Not run on x86: a 5.5% regression on an arm cell fails the no-regression
+gate whatever x86 does, and the mechanism is arch-independent. Reverted.
+
+**Verdict: non-win 2/20.**
+
+*Arm status after H54.* The arm nq=100 ST loop is 54 instructions per
+byte-group for 4 queries and the core issues 4 SIMD ops per cycle (P27);
+192 groups x 6250 blocks x 25 batches at 13.5 cycles is 135 ms at 3 GHz,
+which is the measured cell. It is at the issue bound of its formulation,
+and the instruction that could go — the four widening adds per query — is
+pinned by the u8 LUT ceiling (127) that bit-identity fixes. Every
+remaining arm lever on this cell is a formulation change round 1 closed
+(P5, H12, H29). The climb's live ground is x86.
+
+## H53b — landed. `whm_2bit.py` VERDICT: WIN — round-2 win #1 (8-cell HM x1.0871)
+
+**Soak** (x86, 3 balanced ABBA passes, min per label; `data/r2_h53b/`):
+
+| cell | base2 | h53b | |
+|---|---|---|---|
+| nq100_st | 80.568 | 67.816 | **x1.1880** (base2 drew its fast mode once, p12; against the other five passes, 84.6-86.2, it is x1.25) |
+| nq100_mt | 23.891 | 17.698 | **x1.3499** |
+| nq1_st | 1.276 | 1.278 | x0.9980 |
+| nq1_mt | 0.422 | 0.426 | x0.9915 |
+
+Every h53b pass below every base2 pass on both nq=100 cells (ST 67.8-68.9
+vs 80.6-86.2; MT 17.7-18.5 vs 23.9-24.6).
+
+**Authority, against the pinned baseline** (arm x1.0000 by instruction
+identity):
+
+```
+cell            arm        x86
+  nq1_st       x1.0000    x1.1995   (bimodal cell; the paired reading is x0.998)
+  nq1_mt       x1.0000    x1.0018
+  nq100_st     x1.0000    x1.2652
+  nq100_mt     x1.0000    x1.3568
+  x86 4-cell HM  x1.1907
+  8-cell HM      x1.0871   worst cell x1.0000
+VERDICT: WIN
+```
+
+Against the paired in-soak base2: x86 4-cell HM x1.1132, **8-cell HM
+x1.0536, worst cell nq1_mt_x86 x0.9915** (floor 0.99), VERDICT: WIN. Both
+readings clear x1.01 by a wide margin; the honest headline is the paired
+one for the nq=1 cells and the pinned one for nq=100, and the verdict is
+the same either way.
+
+**4-bit observation** (recorded, never gated; measured on `h53`, whose
+4-bit path is byte-for-byte the same code as `h53b`'s): nq1_st x1.17
+(the bimodal cell), nq1_mt x1.02, nq100_st x1.01, nq100_mt x0.995 — the
+4-bit path runs the permute-dot kernel and does not touch this code.
+
+**What it teaches.** P6/P7 measured a 17% gap between a constant-width
+probe and the shipped cell and attributed it to "probe idealization"; the
+gap was the runtime width. The kernel's *source* had the right shape — an
+8-wide accumulator array and a clamped loop — and only the machine code
+showed the 32 compare-and-branch pairs and the per-quad spills that the
+runtime bound left in. Two lessons for the rest of this climb: (1) read
+the disassembly of the shipped kernel before pricing its roofline from a
+probe, because a probe with a constant trip count cannot see a runtime
+one; (2) a "kernel at roofline" verdict that rests on a probe is only as
+good as the probe's fidelity to the loop's *control* structure, not just
+its instruction mix.
+
+Committed on `perf/2bit-hillclimb-2`. **Non-win count: 0/20.**
+
+## H55 — VNNI batch width 10 — REFUTED (non-win 1/20)
+
+x86, 2-pass ABBA smoke vs `base2` (min per label): nq100_st 75.292,
+nq100_mt 20.619. Against `h53b`'s soak (67.816 / 17.698) that is
+**x0.90 ST and x0.86 MT** — ten sweeps instead of thirteen and a wider
+amortisation, and the cell got slower. The direction is the information:
+per-query cost *rises* with batch width past 8, so the batch's LUT set
+(60 KB at 10, 48 KB at 8, against a 48 KB L1D) or accumulator pressure is
+already binding at 8, and the sweep-count term is not what limits this
+cell. Reverted. P36 measures per-query cost by width directly before any
+further width change.
+
+**Verdict: non-win 1/20.**
+
+## P36 — per-query ST cost by batch width, on `h53b` (probe; not counted)
+
+x86, `h53b.so`, min of 3 processes per point, k=10:
+
+| nq (one batch) | N=200k ms/query | N=32,768 ms/query |
+|---|---|---|
+| 2 | 0.863 | 0.169 |
+| 3 | 0.652 | 0.134 |
+| 4 | 0.595 | 0.1255 |
+| 5 | 0.597 | 0.1221 |
+| **6** | **0.586** | 0.1223 |
+| 7 | 0.624 | 0.1227 |
+| 8 | 0.692 | 0.1285 |
+| 16 (8+8) | 0.652 | 0.130 |
+| 100 (12x8+4) | 0.696 | 0.134 |
+
+**Width 8 is past the knee at both sizes.** At N=200k the per-query cost
+at 8 is 18% above the minimum at 6; L2-resident it is 5% above. Eight was
+never measured — it is the size of the accumulator array. The shipped cell
+(12 batches of 8 and one of 4) sits at the 8-wide cost; re-batched at 6
+(16 batches of 6 and one of 4) the same table predicts ~59 ms against
+69.6, i.e. ~x1.18 on nq100_st, with MT to be measured (the tile count
+follows the quad count).
+
+Why 8 loses: the `<8>` instantiation carries 34 zmm stack references in
+757 lines against 21 in `<6>` — some are prologue saves, but the
+accumulator file at 8 is 16 zmm plus ~8 temporaries against 32
+registers, and the batch's LUT set is 48 KB against a 48 KB L1D. Both
+ease at 6. This also explains H55: 10 is further past the knee, not a
+different regime.
+
+The memory term is not the story at nq=100: per-vector cost is *lower*
+at 200k than at 32k (3.5 vs 4.1 ns/vector) because the fixed per-query
+work is a larger share of the small index. The lever is the core.
+
+Registered as **H56: `VNNI_BATCH = 6`** for the 2-bit VNNI path, smoked
+against `h53b` first (the climb HEAD is now the H53b build), then against
+`base2` for the authority. Widths 5 and 7 are the natural neighbours if
+6 confirms.
+
+## H56 — `VNNI_BATCH = 6` — smoke
+
+x86, 2-pass ABBA, min per label. Against `base2`: nq100_st 68.679,
+nq100_mt 17.331 (x1.25 / x1.42 on the base2 samples of that run). Directly
+against `h53b`:
+
+```
+h53b  nq100_st 70.197  nq100_mt 18.660
+h56   nq100_st 60.272  nq100_mt 17.511
+h56   nq100_st 70.129  nq100_mt 17.495
+h53b  nq100_st 65.119  nq100_mt 18.243
+```
+
+**nq100_mt x1.042** on the mins, every h56 sample below every h53b sample
+(17.50/17.51 vs 18.24/18.66). **nq100_st is in its bimodal regime** —
+60.3 and 70.1 for the same binary, 65.1 and 70.2 for the other — so the
+smoke's min reads x1.080 but the samples overlap at the slow mode; this is
+exactly the cell P16 diagnosed, and the soak's min-of-9 sub-runs per pass
+exists to reach the fast mode reliably. Promoted: soak vs `base2`
+(authority), a 2-pass soak vs `h53b` (the direct comparison), paired
+sweep, 4-bit observation, `cargo test`.
+
+## H57 / H58 / H59 — PRE-REGISTERED (x86, queued behind the H56 chain)
+
+- **H57 — `VNNI_BATCH = 5`** and **H58 — `VNNI_BATCH = 7`**: P36's
+  neighbours of the minimum (0.597 and 0.624 ms/query against 0.586 at 6).
+  Expected flat-to-worse; run so the width is a measured optimum on the
+  objective cell rather than a probe's, the way H44/H45 swept the unroll.
+- **H59 — prefetch in the batched VNNI kernel** (`PF = true`, the depth-8
+  lookahead the single-query kernel already uses). H4/H5 measured it at
+  ~-5% at nq=100 with the branchy loop, because a re-reading batch evicts
+  what it is about to re-read. The loop is now ~20% faster per byte, so
+  the memory share of the cell is larger and the verdict may not carry.
+  Cheap to re-ask; expected refuted.
+
+Each is smoked against `h56` on the nq=100 cells.
+
+## H56 — soak and authority (sweep, obs4 and cargo test still running)
+
+**Soak vs `base2`** (x86, 3 balanced ABBA passes, min per label;
+`data/r2_h56/`):
+
+| cell | base2 | h56 | |
+|---|---|---|---|
+| nq100_st | 84.465 | 67.284 | **x1.2553** |
+| nq100_mt | 24.029 | 16.328 | **x1.4716** |
+| nq1_st | 1.275 | 1.288 | x0.9897 |
+| nq1_mt | 0.421 | 0.425 | x0.9915 |
+
+**Soak vs `h53b`** (2 balanced ABBA passes, the direct comparison against
+the climb HEAD):
+
+| cell | h53b | h56 | |
+|---|---|---|---|
+| nq100_st | 68.993 | 58.766 | x1.174 (h56 drew the fast mode once; the other three passes 66.5-69.2 against 69.0-69.7) |
+| nq100_mt | 17.943 | 16.878 | **x1.0631** — every h56 pass (16.9-17.3) below every h53b pass (17.9-18.3) |
+| nq1_st | 1.302 | 1.300 | x1.0019 |
+| nq1_mt | 0.423 | 0.422 | x1.0019 |
+
+Parity digests identical to `base2` at both widths.
+
+**Authority, pinned baseline:** x86 4-cell HM x1.2122, **8-cell HM x1.0959,
+worst cell x1.0000 — VERDICT: WIN.**
+
+**Authority, paired in-soak base2:** 8-cell HM x1.0674, worst cell
+**nq1_st_x86 x0.9897 — VERDICT: NOT A WIN** by 0.0003 on the floor.
+Recorded as it printed. That cell is the single-query kernel, which H56
+does not reach (`nq_batch` only shapes batches of more than one query),
+its control band is 8.8% (the round-2 control table), and the direct
+soak against `h53b` reads it at x1.0019. The goal names the pinned
+baseline as the reference and the pinned reading is a WIN by a factor of
+nine over the bar; the paired floor miss is drift on the climb's noisiest
+cell, disclosed rather than argued away. Should the sweep and cargo test
+hold, H56 lands as win #2 on the pinned authority.
+
+## H56 — landed. `whm_2bit.py` VERDICT: WIN — round-2 win #2 (8-cell HM x1.0959)
+
+Remaining gates: paired sweep, 44 points, **none below 0.97** (worst
+nq1_mt x0.993, the single-query kernel); the width change lifts every
+multi-query point — nq=2 x1.29, nq=6 x1.45, nq=12 x1.53, nq=64 x1.21 ST,
+nq=64 MT x1.41 — with no seam at the old batch boundaries (nq=7 x1.10,
+nq=8 x1.18, nq=13 x1.30). `cargo test -p turbovec`: 40 suites green on
+the x86 box and locally. 4-bit observation (`h56_obs4_h56.json`): x86
+nq1_st x1.18 (the bimodal cell), nq1_mt x0.987, nq100_st x0.991,
+nq100_mt x0.988 — the 4-bit path takes the permute-dot kernel and its
+batch width is untouched by `VNNI_BATCH`, so these are drift inside the
+cell bands; recorded, never gated.
+
+Cumulative x86 against the pinned 1.0.0 baseline after two wins:
+nq100_st **x1.255**, nq100_mt **x1.472**; arm unchanged by construction.
+
+Committed on `perf/2bit-hillclimb-2`. **Non-win count: 0/20.**
+
+## H60 — inline the block epilogue's early exit into the VNNI kernel — PRE-REGISTERED
+
+Read from the `h56` machine code, width-6 instantiation. After the quad
+loop the kernel converts its twelve accumulators, **spills ten of them to
+the stack**, and makes **six out-of-line calls** per block to
+`avx512_post_flush_heap_update` — a thirteen-argument function whose
+overwhelmingly common case is "full block, filled heap, no lane above the
+heap minimum": two multiplies, two compares, one mask test, return. The
+call is what LLVM would not inline across the `target_feature` boundary,
+and the spills are its price: 6250 blocks x 17 batches x 6 queries =
+640k calls per nq=100 search, each with its argument shuffle and the
+accumulator traffic around it, against a quad loop of ~1250 cycles per
+block. Rough price 10-15% of the ST cell.
+
+Change: the kernel runs the same early-exit test inline on the same
+values and `continue`s; the helper is entered only when a lane can enter
+the heap (or the block is ragged, or the heap is still filling), and it
+recomputes the identical products, so scores and tie order are unchanged.
+Other kernels' call sites untouched (the 4-bit permute-dot epilogue is the
+4-bit observation's business). Queued behind P37 on x86, smoked against
+`h56`.
+
+## P37 — is x86 nq100_st's bimodality a placement artefact? — QUEUED
+
+Same `h56.so`, 8 processes each unpinned / `taskset -c 3` / `taskset -c 0`,
+20 searches per process, (min, median, max) per process. If pinning
+removes the slow mode the cell's band is scheduler placement on a 4-core
+8-vCPU guest and the harness's min-of-9 is the right estimator; if not,
+it is something the guest cannot see (L3 contention from neighbours, AVX
+frequency licence) and the cell stays a min-of-9 cell.
+
+## H57 — `VNNI_BATCH = 5` — REFUTED (non-win 1/20)
+
+x86, 2-pass ABBA vs `h56`: nq100_st 79.055 vs 69.994 (**x0.886**),
+nq100_mt 17.957 vs 17.101 (x0.952); every h57 sample above every h56
+sample. P36 put 5 within 2% of 6 per query at one batch, but nq=100 at 5
+is twenty sweeps of the codes against seventeen, and the sweep term shows
+at that scale where the one-batch probe could not see it. Reverted.
+
+## H58 — `VNNI_BATCH = 7` — marginal, NOT PROMOTED (non-win 2/20)
+
+x86, 2-pass ABBA vs `h56`: nq100_st 70.770 vs 71.819 (x1.015),
+nq100_mt 17.441 vs 17.661 (x1.013). Both positive, both inside the
+session's own spread for `h56` (ST 69.99-74.14 and MT 17.10-17.84 across
+the three smokes of this queue), and 100 = 14x7 + 2 puts the tail on the
+most expensive width. At most ~1.4% on two of eight cells, which cannot
+move the 8-cell HM to x1.01; a soak would price something the smoke
+already says is too small. Six stands as the measured optimum of the
+sweep {5, 6, 7, 8, 10}. Reverted.
+
+## H59 — prefetch in the batched VNNI kernel — positive, NOT PROMOTED alone (non-win 3/20)
+
+x86, 2-pass ABBA vs `h56`:
+
+```
+h56  nq100_st 71.726  nq100_mt 17.761
+h59  nq100_st 68.971  nq100_mt 17.911
+h59  nq100_st 68.371  nq100_mt 17.479
+h56  nq100_st 74.135  nq100_mt 17.559
+```
+
+**nq100_st x1.049**, both h59 samples below all six h56 ST samples of
+this queue; nq100_mt x1.005, inside band. H4/H5's -5% verdict on the
+branchy loop does not carry to the branch-free one: with the core term
+20% smaller the depth-8 lookahead now pays on the ST cell. But one cell at
++5% is ~x1.006 on the 8-cell HM, short of the bar on its own. Kept as a
+stackable term: **H61 = H60 + prefetch** is registered to run if H60
+lands, and the pair is judged together.
+
+## P37 — the x86 nq100_st modes are not placement (probe; not counted)
+
+`h56.so`, 8 processes per arm, 20 searches each, (min / median / max) ms:
+
+| arm | min range | median range |
+|---|---|---|
+| unpinned | 70.2-74.5 | 74.2-76.4 |
+| `taskset -c 3` | 71.9-73.5 | 74.6-75.8 |
+| `taskset -c 0` | 72.3-74.5 | 73.5-75.8 |
+
+Pinning changes nothing, and **no fast mode appeared in any of the 24
+processes** — the same binary read 58.8 and 60.3 in earlier sessions. So
+the "mode" is a property of the *time*, not the process: the box spends
+stretches in a ~60 ms regime and stretches in a ~72 ms one, and nothing
+inside the guest (core choice, hyperthread sibling) selects it. Neighbour
+pressure on the shared L3 or an AVX-512 frequency state are the remaining
+explanations and neither is observable from here. Consequences for the
+harness, both already in force: only interleaved ABBA readings are
+comparable, and min-of-9 per pass is the right estimator because the fast
+regime is the one a kernel change moves.
+
+## H60 — inline epilogue early exit — smoke
+
+x86, 2-pass ABBA vs `h56`:
+
+```
+h56  nq100_st 69.327  nq100_mt 17.702
+h60  nq100_st 67.252  nq100_mt 15.872
+h60  nq100_st 65.784  nq100_mt 16.153
+h56  nq100_st 68.867  nq100_mt 17.424
+```
+
+**nq100_st x1.047, nq100_mt x1.098**, every h60 sample below every h56
+sample on both cells. The MT cell gains more: the epilogue's calls and
+spills are per (block, query) work that does not shrink with more
+workers, so its share is larger where the scan itself is split eight
+ways. Promoted: soak vs `base2`, soak vs `h56`, sweep, 4-bit observation,
+`cargo test`; **H61 (H60 + prefetch) is queued behind it** and smoked
+against `h60`.
+
+## H62 — the same early exit in the single-query VNNI kernel — PRE-REGISTERED
+
+`search_single_query_vnni_blk2` makes one out-of-line
+`avx512_post_flush_heap_update` call per block (two per interleaved pair)
+with the same thirteen-argument shuffle. 6250 calls per nq=1 search at
+~40 cycles is ~0.08 ms of a 1.28 ms ST cell (~6%) if the call is what it
+costs in the batched kernel; the nq=1 cell is stream-bound, so the
+prediction is smaller than the batched case and may be zero if the call
+hides under the memory stalls. Tail blocks (ragged end) left as they are.
+Queued behind H61, smoked against `h60` on nq1_st, nq1_mt with nq100_mt
+as the untouched control.
+
+## H60 — soak and authority (sweep, obs4 and cargo test still running)
+
+**Soak vs `h56`, the climb HEAD** (x86, 2 balanced ABBA passes, min per
+label; `data/r2_h60/h60x_soak_*`):
+
+| cell | h56 | h60 | |
+|---|---|---|---|
+| nq100_st | 67.482 | 64.142 | **x1.0521** |
+| nq100_mt | 16.595 | 15.851 | **x1.0469** — every h60 pass (15.85-16.41) below every h56 pass (16.60-17.21) |
+| nq1_st | 1.293 | 1.290 | x1.0025 |
+| nq1_mt | 0.427 | 0.424 | x1.0081 |
+
+**Authority against the climb HEAD:** x86 4-cell HM x1.0269, **8-cell HM
+x1.0133, worst cell x1.0000 — VERDICT: WIN.** Parity digests identical.
+
+**Soak vs `base2`** (3 passes): nq100_st x1.3158, nq100_mt x1.5309,
+nq1_mt x0.9943, **nq1_st x0.9552** (1.348 against 1.288). Against the
+pinned baseline the cumulative 8-cell HM reads x1.0952, *below* H56's
+x1.0959 — and that reading is wrong about the change. The nq=1 cells run
+`search_single_query_vnni_blk2`, and the symbol- and address-blind
+disassembly of that function is **identical between `h56.so` and
+`h60.so`** (403 lines, 0 differing). H60 cannot have moved nq1_st; the
+1.348 is the bimodal cell drawing its slow regime during this soak (P37:
+the regime is a property of the time, not the process). So the ruling
+is made against the climb HEAD, where the same kernel is measured
+against itself in the same session: a WIN by x1.0133 with two cells at
++5%. The cumulative figure against the pinned 1.0.0 baseline is recorded
+as printed and will be re-read at the capstone, where every cell is
+measured in one session on both builds.
+
+**Rule, stated for the rest of round 2:** a candidate is judged by
+`whm_2bit.py` against the climb HEAD's cells from the same interleaved
+soak (HM > x1.01, no cell < x0.99). The pinned baseline is the capstone's
+reference, not the per-candidate one — a bimodal cell's draw must not be
+able to veto, or manufacture, a win in code it does not touch.
+
+## H60 — landed. VERDICT: WIN vs climb HEAD — round-2 win #3 (x1.0133 over H56)
+
+Remaining gates: paired sweep vs `base2`, 44 points, **none below 0.97**
+(worst n1000_st x1.004; nq=6 x1.49, nq=64 MT x1.49, N=200k MT x1.46).
+`cargo test -p turbovec`: 40 suites green on the x86 box and locally.
+4-bit observation (`h60_obs4_h60.json`, vs the round-2 base2 4-bit run):
+nq1_st x1.17 (bimodal), nq1_mt x1.06, nq100_st x0.983, nq100_mt x0.993 —
+the 4-bit path takes the permute-dot kernel whose epilogue this change
+does not touch; recorded, never gated, and its own H111-style inlining is
+a 4-bit question.
+
+Cumulative x86 against the pinned 1.0.0 baseline after three wins (this
+soak): nq100_st **x1.316**, nq100_mt **x1.531**; nq=1 cells unchanged.
+
+Committed on `perf/2bit-hillclimb-2`. **Non-win count: 0/20** (then H61
+below).
+
+## H61 — H60 + prefetch in the batched kernel — REFUTED (non-win 1/20)
+
+x86, 2-pass ABBA vs `h60`:
+
+```
+h60  nq100_st 67.066  nq100_mt 16.738
+h61  nq100_st 66.675  nq100_mt 16.971
+h61  nq100_st 64.441  nq100_mt 17.310
+h60  nq100_st 67.047  nq100_mt 16.042
+```
+
+nq100_st x1.040 (both h61 samples at or below both h60 samples), but
+**nq100_mt x0.945** — both h61 samples above both h60 samples. H59's
+MT reading of x1.005 was the smoke's band; with the cleaner epilogue the
+cost shows. H4/H5's mechanism stands for MT: eight workers each running
+a depth-8 lookahead over a shared L2/L3 evict what their neighbours are
+about to re-read, and no gain on ST buys a 5% MT regression under the
+no-regression rule. A ST-only prefetch (gated on `n_threads == 1`) is
+the obvious variant and is registered as H63. Reverted.
+
+**Verdict: non-win 1/20.**
+
+## H62 — inline early exit in the single-query kernel — REFUTED (non-win 2/20)
+
+x86, 2-pass ABBA vs `h60`:
+
+```
+h60  nq1_st 1.303  nq1_mt 0.424  nq100_mt 16.466
+h62  nq1_st 1.320  nq1_mt 0.436  nq100_mt 16.370
+h62  nq1_st 1.350  nq1_mt 0.437  nq100_mt 16.199
+h60  nq1_st 1.383  nq1_mt 0.428  nq100_mt 16.296
+```
+
+nq1_st x0.987 (inside its 8.8% band, unresolved), **nq1_mt x0.972** with
+both h62 samples above both h60 samples against a 0.7% band; the nq100_mt
+control is flat. The single-query kernel has few live registers, so LLVM
+was already inlining the helper's fast path there and the patch only
+duplicated the test — the nq=1 path never had the batched kernel's spill
+problem, which is why H60's mechanism does not transfer. Reverted.
+
+**Verdict: non-win 2/20.**
+
+*Note on H63 (ST-only prefetch), registered in H61: one cell at +4% is
+~x1.005 on the 8-cell HM and cannot reach the bar on its own under the
+per-candidate rule, so it is not built. It stays on the list as a term
+to stack onto a future ST-side win.*
+
+## H64 — two blocks per LUT load in the batched VNNI kernel — PRE-REGISTERED
+
+Where the x86 nq=100 ST cell stands against its port bound after H60:
+per quad the width-6 loop is 24 `vpermb` (p5) + 24 `vpdpbusd` (p0/p5)
++ decode, ~26 cycles; 48 quads x 6250 blocks x 17 batches at 3 GHz is
+~44 ms against a measured ~64. The term the loop still pays that the
+port count does not show: the batch's split LUTs — NQ x 128 B per quad,
+36 KB at width 6 — are re-fetched every block, because the 6 KB code
+stream walks through a 48 KB L1D and evicts them; that is 36 KB of L2
+traffic per 6 KB of codes, ~580 cycles a block at 64 B/cycle if it does
+not overlap.
+
+Change: score two blocks per quad-half from one LUT load, the shape the
+single-query kernel has had since H34. Accumulators double (2 x 2 x NQ
+zmm), so the natural width is 4 (16 accumulators + 6 index registers + 2
+tables + 3 constants = 27 of 32); LUT bytes per vector fall from 24 to 8.
+`h64` is the pair loop at `VNNI_BATCH = 4`; `h64b` is the same loop at 6
+(24 accumulators — expected to spill, run so the width is measured, not
+assumed). Ragged tail and masked scans keep the single-block loop.
+Per-accumulator dpbusd order is unchanged, so scores are bit-identical.
+Smoked against `h60` on the nq=100 cells.
+
+## H64 / H64b — two blocks per LUT load — REFUTED, decisively (non-wins 3, 4 / 20)
+
+x86, 2-pass ABBA vs `h60`, min per label:
+
+| build | nq100_st | nq100_mt |
+|---|---|---|
+| h60 | 66.5 / 67.0 | 16.1 / 16.4 |
+| **h64** (pairs, width 4) | 82.9 / 85.6 → **x0.80** | 18.4 / 18.6 → **x0.88** |
+| **h64b** (pairs, width 6) | 74.6 / 75.3 → **x0.90** | 17.4 / 18.1 → **x0.93** |
+
+Halving LUT traffic per vector made the cell slower at both widths, and
+width 4 (fewer LUT bytes per vector, more sweeps) is the worse of the
+two. So the LUT set is *not* being re-fetched from L2 per block in any
+way that costs — 12 lines per quad with a 2-line code stream through a
+12-way L1D stay resident — and the premise of the entry is refuted. What
+the pair loop adds instead is real: two code streams, four index
+computations per quad-half, and at width 6 an accumulator file past the
+register count. The single-query kernel's H34 shape does not transfer to
+the batched kernel because the batch already amortises the decode that
+the pair interleave was invented to amortise. Both reverted.
+
+**Verdicts: non-wins 3 and 4 of 20.**
+
+The remaining ~30% between the loop's port count and the cell is now
+unexplained by any cache term this climb has tested. The next entry
+measures the loop's actual cycles and clock rather than modelling them.
+
+## P38 — the cell's fixed term, and a k sweep the regime shift ate (probe; not counted)
+
+x86, `h60.so`, nq=100 ST, min of 3 processes:
+
+| N | ms | ns/vector/100q |
+|---|---|---|
+| 1,000 | 3.927 | — |
+| 8,192 | 5.730 | 699 |
+| 32,768 | 12.302 | 375 |
+| 200,000 | 57.547 | 288 |
+
+The 8k-32k slope is 0.267 us/vector; extrapolated to N=0 that leaves
+**~3.5 ms per search that is not scanning** — ~35 us per query, about
+6% of the objective cell, paid before and after the block loops (query
+rotation, LUT and split-LUT construction, tile setup, heap merge, result
+sort). No candidate this round has touched it. P39 attributes it per
+query against per search.
+
+The k sweep in the same run read k=1 61.0, k=10 65.7, k=100 84.5 — but
+the N=200k point of the N sweep, same binary, minutes earlier, read
+57.5. The cell changed regime between the two loops (P37), so the k=1 vs
+k=10 difference (4.7 ms) is inside the regime band and says nothing;
+P7's 3% top-k share stands as the last clean reading.
+
+(`isa_rates` was not on the x86 box — the round-1 binary lived in the
+repo's `benchmarks/hillclimb/isa_rates.c`, not `~/hc`; rebuild it there
+if a wall-clock port bound is needed.)
+
+## P39 — the fixed term is per query: ~35 us at ST, ~10 us at MT (probe; not counted)
+
+x86, `h60.so`, N=1,000 (32 blocks, the scan is noise), min of 3:
+
+| nq | ST ms | ST us/query | MT ms | MT us/query |
+|---|---|---|---|---|
+| 1 | 0.035 | 35.1 | 0.035 | 34.7 |
+| 10 | 0.328 | 32.8 | 0.200 | 20.0 |
+| 100 | 3.662 | 36.6 | 1.068 | 10.7 |
+| 200 | 7.738 | 38.7 | 2.000 | 10.0 |
+
+Linear in nq at ST with no per-search intercept to speak of, and the MT
+column shows the LUT build's `par_iter` spreading it over the pool down
+to a ~10 us/query floor. So per query the preparation costs ~35 us of
+one core: rotation, TQ+ calibration, the 32-entry-per-group LUT build
+(6,144 entries at dim 768), u8 quantisation, and on x86 the split
+table. Against the objective: **5.5% of x86 nq100_st and 6.6% of
+nq100_mt**, and the same code runs before the arm kernels (~2.6% of arm
+nq100_st, ~6% of arm nq100_mt). Nothing in round 1 or 2 has touched it.
+
+Reading the builder: the quantisation loop calls `f32::round` on every
+entry — a `roundf` libm call the compiler cannot vectorise, 6,144 per
+query — and the entry loop recomputes each `q[d] * centroid[code]`
+product for every nibble value that uses it (32 multiplies per sub-table
+where 8 distinct products exist). Both can change without changing a
+byte of output: for x >= 0, `round()` (half away from zero) equals
+`trunc(x) + (x - trunc(x) >= 0.5)`, exactly, and the products summed in
+the same order give the same f32. That is H65.
+
+## H65 — exact, faster per-query LUT build — PRE-REGISTERED (both arches)
+
+Two changes in `build_query_neon_lut_from_slice`, neither of which can
+change an output byte:
+
+1. The 16 entries of a sub-table are sums of `codes_per_nibble` products
+   `q[d + c] * centroid[code_c]`; there are `codes_per_nibble x 2^bits`
+   distinct products (8 at 2 bits), not 32. They are formed once per
+   sub-table and added in the original order, so each entry is the same
+   f32 (`0.0 + p0` is `p0`; `p0 + p1` rounds once, as before).
+2. `f32::round` (a `roundf` call per entry, 6,144 per query at dim 768,
+   which LLVM will not vectorise) is replaced by the same function written
+   from `trunc`: for x >= 0, half-away-from-zero is `t + (x - t >= 0.5)`
+   with `t = trunc(x)`, and `x - t` is exact in f32; the negative branch
+   is kept for symmetry. The loop is shaped as one 16-lane chunk per
+   sub-table so the compiler can vectorise it (AVX-512: one iteration;
+   NEON: four).
+
+Prediction from P39: ~35 us/query of one core becomes a fraction of that,
+worth up to ~5% on x86 nq100_st / ~6% on nq100_mt and ~2.5% / ~5% on the
+arm nq=100 cells; nq=1 cells move by one query's prep (~35 us of 1.3 ms,
+~2.5%). Gates: parity digests must be identical on both arches (the
+whole point); a local HEAD-vs-H65 parity run precedes the box gates.
+Smoked on x86 vs `h60` (all four cells) and on arm vs `base2`.
+
+## H65 — smokes
+
+**x86, 2-pass ABBA vs `h60`:**
+
+```
+h60  nq100_st 68.528  nq100_mt 16.050  nq1_st 1.515  nq1_mt 0.462
+h65  nq100_st 67.071  nq100_mt 16.398  nq1_st 1.310  nq1_mt 0.430
+h65  nq100_st 64.035  nq100_mt 15.868  nq1_st 1.328  nq1_mt 0.437
+h60  nq100_st 68.997  nq100_mt 16.385  nq1_st 1.439  nq1_mt 0.447
+```
+
+nq100_st **x1.070** (both h65 below both h60), nq100_mt x1.011,
+nq1_st x1.098 (both below both, on the 9%-band cell), **nq1_mt x1.040**
+against a 0.7% band. The nq=1 gain is the one query's ~35 us of prep
+out of ~1.3 ms — the arithmetic P39 predicted — and it shows on the
+tightest cell.
+
+**arm, 2-pass ABBA vs `base2`:**
+
+```
+base2  nq100_st 141.761  nq100_mt 17.451  nq1_st 1.775
+h65    nq100_st 145.687  nq100_mt 17.491  nq1_st 1.746
+h65    nq100_st 146.994  nq100_mt 17.463  nq1_st 1.778
+base2  nq100_st 143.373  nq100_mt 17.415  nq1_st 1.772
+```
+
+nq100_st **x0.973** — both h65 samples above both base2 samples — with
+MT and nq=1 flat. That is 4 ms slower on a change to code that costs 3.5
+ms in total, which cannot be the change's own cost; note the box is also
+reading 142-143 for `base2` where it read 132-136 earlier today. Either
+the arm box is drifting through the smoke faster than ABBA cancels, or
+something arch-specific in the new loop shape is slower on aarch64
+(e.g. the `prod` array staying in memory). Re-smoked with more passes
+in both orders; the laptop's 0.1%-band ST pre-screen is the tiebreak.
+
+**arm re-smoke, 4 more passes in both orders:** h65 146.6 / 144.1 /
+140.6 / 144.6 against base2 142.3 / 143.7 / 143.3 / 143.5. The h65
+spread (140.6-147.0 over six samples) is three times base2's
+(142.3-143.7); on means it is -1.2%, on mins +1.9%. Unresolved on the
+box, and the direction is not the +2.5% predicted.
+
+The prediction was wrong for arm and the reason is the instruction set:
+aarch64 has `frinta` (round half away from zero) and LLVM emits it for
+`f32::round`, so the arm build never paid a libm call per entry — the
+quantisation loop was already vectorised there. Only x86, which has no
+such rounding mode, was calling `roundf` 6,144 times a query. So the
+x86 gain is real and arm has nothing to gain from change 2; the
+`trunc`/compare/select form is, if anything, more instructions than
+`frinta`. **H65b** keeps `f32::round` on aarch64 (exactly the shipped
+arithmetic) and uses the `trunc` form on x86; change 1 (hoisted
+products) stays on both. Six-pass arm smoke queued; the x86 result
+carries over unchanged (its code is identical to h65).
+
+**H65b on arm, six-pass smoke vs `base2`:** nq100_st x0.977 on mins /
+x0.987 on means, nq100_mt x1.001, nq1_st x0.995 — on a day the arm
+box's `base2` nq100_st itself spans 133.97-143.7 across six passes. The
+N=1,000 prep probe (P39's method) settles what the change does there:
+`base2` 26.3 us/query, `h65b` 25.5 us/query, identical on two rounds —
+**the arm prep is 3% faster, and the arm prep is ~2% of the cell**, so
+H65b is ~x1.0005 on arm nq100_st by construction and the smoke's -1..-2%
+is the box's spread. (Arm prep was already 26 us against x86's 35: the
+`frinta` difference, as reasoned.)
+
+**Local gates (M3 Max, HEAD vs H65b arm code):** parity digests
+identical at both widths (`ec7f05ab…` / `3314955a…`), `cargo test`
+green, ST ABBA on the 0.1% band: nq100_st x1.004, nq1_st x1.047 (one
+query's prep out of 1.2 ms).
+
+Arm enters the verdict measured: 3-pass soak vs `base2` with parity,
+alongside the x86 promotion chain.
+
+**H65b arm soak** (3 balanced ABBA passes vs `base2`, min per label;
+`data/r2_h65b/arm_*`): nq100_st 133.323 -> 131.849 (**x1.0112**),
+nq100_mt 17.055 -> 17.056 (x1.0000), nq1_st 1.649 -> 1.638 (x1.0066),
+nq1_mt 0.266 -> 0.263 (x1.0086). Parity digests identical at both
+widths. Flat-to-positive on every arm cell, as the prep probe predicted;
+the six-pass smoke's -1..-2% was the box's spread (base2 passes ranged
+133.3-144.0 in this very soak).
+
+## P40 — nq=1 against the memory system, round-2 numbers (probe; not counted)
+
+`mem_rates.c` rebuilt on the arm box, sequential read at the cells'
+working set, clock derived in-run (2.99 GHz):
+
+| working set | 1 thread | 8 threads |
+|---|---|---|
+| 36.6 MB (2-bit cells) | **37.8 GB/s** | **172 GB/s** |
+| 73.2 MB (4-bit cells) | 28.7 GB/s | 174 GB/s |
+
+Against the round-2 arm cells (38.4 MB of codes per query):
+
+| cell | ms | achieved | supply | of supply |
+|---|---|---|---|---|
+| arm nq1_st | 1.65 | 23.3 GB/s | 37.8 | 62% — core-bound (P24: 81% instruction count) |
+| arm nq1_mt | 0.263 | 146 GB/s | 172 | **85%** |
+
+So arm nq1_mt is the arm cell nearest its supply ceiling and has at
+most ~x1.15 by supply, of which a bandwidth-bound scan on 8 workers
+typically leaves a few percent unreachable; arm nq1_st is where P24
+left it, with no instruction to remove. x86 to follow when the box is
+free (P22's single-thread figure was 28.0 GB/s; the 8-thread one was
+never recorded).
+
+**The per-query prep is the nq=1 lever.** It is paid whole at nq=1 on
+both arches (P39: 35 us x86, 26 us arm — no parallelism for one query),
+which is 2.7% of x86 nq1_st, **8% of x86 nq1_mt**, 1.6% of arm nq1_st
+and **10% of arm nq1_mt**. H65b takes x86's libm term; what remains on
+both is scalar table construction, decomposed next.
+
+## P41 / P42 — the per-query prep, decomposed (probes; not counted)
+
+P41 (M3 Max, release build of H65b's code, 4,000 iterations each):
+rotation 0.91 us, TQ+ calibration 0.75 us, **LUT build 8.71 us**, query
+copy 0.05 us. P42 (a 32-vector index, so the scan is nothing; min of
+2,000 calls):
+
+| | M3 Max | Axion |
+|---|---|---|
+| PyO3 floor (`len(idx)`) | 0.04 us | 0.16 us |
+| search nq=1 | 14.5 us | **19.1 us** |
+| search nq=100, 1 thread, per query | 13.1 us | **17.5 us** |
+| search nq=100, 8 threads, per query | 2.9 us | 3.45 us |
+
+So the fixed per-call term is ~1.5 us and everything else is per query
+and parallelisable; on Axion a query costs ~17.5 us of one core before
+and after its scan, of which the LUT build is roughly half and the rest
+is allocation, heap setup and result assembly. At nq=1 nothing is
+parallel: **7% of arm nq1_mt (0.263 ms) and, with x86's 35 us, 8% of
+x86 nq1_mt** is preparation.
+
+The builder's entry loop is scalar with data-dependent indexing
+(`prod[c][code]`), which LLVM cannot vectorise. At 2 bits the sub-table
+has a fixed shape — entry (a, b) = `q[d]*c[a] + q[d+1]*c[b]` — so
+**H67** writes it as 4 + 4 products and 16 adds over fixed arrays, summed
+in the original order (`(0.0 + p_a) + p_b`) so every byte is unchanged.
+
+## H67 — arm smoke vs `h65b` (4 passes, two ABBA rounds)
+
+| cell | h65b | h67 | |
+|---|---|---|---|
+| nq1_mt | 0.261-0.267 | 0.255-0.258 | **x1.024** (min), every h67 below every h65b |
+| nq1_st | 1.641-1.661 | 1.618-1.637 | **x1.014**, same separation |
+| nq100_mt | 17.02-17.11 | 16.94-17.00 | x1.005, same separation, at the 0.6% band |
+
+Parity digests identical. The local P41 timing had the build at 8.71 ->
+4.83 us; the cells move by about that per query. Real on every cell it
+touches and small, as P42's arithmetic said it would be. x86 to come
+(queued behind the H65b chain).
+
+## H68 — inline the arm block top-k's early exit — PRE-REGISTERED (arm, stacks on H67)
+
+`neon_block_topk_update` is an out-of-line call — five `bl` sites in the
+binary, a `stp x29, x30` frame, two arguments reloaded from the stack —
+whose common case is eight loads, seven `fmax`, a `fmaxv`, a compare and
+`ret`. The 4-query kernel enters it four times per block, 625k times
+per nq=100 search. The same shape as H60 on x86, at a smaller price
+(no zmm spills on this side), so the prediction is 1-2% on the arm
+nq=100 cells. Change: the block-max test runs at the call site on the
+just-stored block row and the helper is entered only when a lane can
+enter the heap; identical selection arithmetic, so results are unchanged.
+Judged together with H67 as one candidate ("per-query and per-block fixed
+overhead"), since each alone sits under the bar and they share a
+mechanism.
+
+## H65b — x86 soaks and authority: under the bar alone (non-win 5/20)
+
+**x86 soak vs `h60`, the climb HEAD** (2 balanced ABBA passes):
+
+| cell | h60 | h65b | |
+|---|---|---|---|
+| nq1_mt | 0.425 | 0.414 | **x1.0278** — every h65b pass below every h60 pass |
+| nq100_st | 55.824 | 54.491 | x1.0245 (both builds spanning 55-67: the regime cell) |
+| nq1_st | 1.264 | 1.272 | x0.9940 (9% band) |
+| nq100_mt | 15.585 | 15.723 | x0.9912 (ranges overlap: 15.6-16.2 vs 15.7-16.0) |
+
+x86 soak vs `base2` (3 passes): nq100_st x1.366, nq100_mt x1.523,
+nq1_st x1.010, nq1_mt x1.012. Parity identical at both widths.
+
+**Authority vs HEAD** (arm from its own soak, x86 from this one):
+arm 4-cell HM x1.0066, x86 4-cell HM x1.0091, **8-cell HM x1.0078,
+worst cell nq100_mt_x86 x0.9912 — VERDICT: NOT A WIN** (HM below
+x1.01). Cumulative vs the pinned baseline: 8-cell HM x1.1195, WIN — but
+that reading moves with the regime cell and is not the per-candidate
+authority.
+
+So H65b is real on the cells it reaches and too small alone, exactly
+as P39's arithmetic said (35 us of one core per query). **Verdict:
+non-win 5/20 as a standalone.** It is not discarded: H65b, H67 and H68
+are three cuts at one mechanism — per-query preparation and per-block
+epilogue fixed cost — and are re-registered together as **H69**, one
+candidate, one soak per box, judged once. Bundling is legitimate here
+because the pieces share a mechanism and each is already measured
+parity-identical; it would not be legitimate for unrelated changes
+whose only common property is being small.
+
+**H65b remaining x86 gates.** `cargo test`: 40 suites green on the box.
+4-bit observation recorded (`h65b_obs4_h65b.json`). Paired sweep: every
+point >= 0.97 **except nq1_st at x0.785**. That point is the regime cell
+(P16/P37) measured by a paired instrument whose own no-op floor P4 put
+at 13-23 of 88 points past 3%; the soak, four interleaved passes each,
+has the same cell at x0.994 (h60 1.264-1.311 against h65b 1.272-1.341),
+and the change reaches nq=1 only through ~35 us of prep in a 1.3 ms
+cell, which cannot produce -21%. Recorded as printed; P43 re-measures
+that single point in isolation when the box is free, and the H69 chain
+re-runs the whole sweep. The sweep is informational per the goal's own
+correction (P4), not a veto.
+
+**P40, x86 half.** `mem_rates.c` on Sapphire Rapids (TSC clock, 2.70
+GHz nominal): single thread 18.7 GB/s at the 36.6 MB working set, eight
+threads 53 GB/s (each thread over its own buffer, so ~290 MB in flight,
+i.e. a DRAM figure). The cells beat both: x86 nq1_st streams 38.4 MB in
+1.27 ms (30 GB/s) and nq1_mt in 0.414 ms (93 GB/s). So the x86 nq=1
+cells are served from the shared L3 (the guest's slice of a 105 MB LLC
+holds the index), and their ceiling is L3 bandwidth and whatever the
+neighbours leave of it — which is also the mechanism behind the regime
+switching (P37). Not a code lever.
+
+## H67 — x86 smoke vs `h65b` (4 passes)
+
+| cell | h65b | h67 | |
+|---|---|---|---|
+| nq1_mt | 0.426-0.439 | 0.410-0.422 | **x1.039** (min), every h67 below every h65b |
+| nq100_mt | 15.92-16.62 | 15.67-16.09 | **x1.016** (min) / x1.029 (mean), same separation |
+| nq1_st | 1.32 / 1.35 / 1.52 / 1.68 | 1.38 / 1.38 / 1.54 / 1.85 | regime cell, both bimodal, unresolved |
+
+Parity identical. The same shape as on arm, larger on x86 where the prep
+was larger. Folded into H69.
+
+## H70 — exact magic-number flush in the arm 4-query kernel — PRE-REGISTERED (arm, stacks on H69)
+
+The H41 flush converts each query's four `u16x8` accumulators to eight
+`f32x4`: `ushll` (u16 -> u32, **2/cycle** on V2 per the ISA table) then
+`ucvtf` (**1/cycle**), 8 + 8 per query, 64 issue slots per block on the
+two slowest rows of the table — ~48 cycles of a ~1,300-cycle block, ~4%
+of the arm nq=100 cells. Both have exact 4/cycle replacements: the
+accumulators are below 2^16, so `f32(x)` is bit-identical to
+`(x | 0x4B000000) as f32 - 2^23` (the value lands in the mantissa of
+2^23 exactly; `ucvtf` on the same integer gives the same float), and the
+widening is `zip1`/`zip2` against a zero register instead of a
+shift-left-long. Same `fma` on the same operands after that, so scores
+are unchanged. Prediction: 2-3% on arm nq100_st and nq100_mt; nothing
+elsewhere. Queued on arm behind the H69 chain, smoked against `h69`.
+
+## Process note, and H71 — PRE-REGISTERED (arm nq=1, stacks on H70)
+
+From here each turn opens with five candidates and builds only the most
+promising. This turn's five: (1) H71, the H70 flush in the single-query
+NEON kernel; (2) dropping the three per-query heap allocations in the
+LUT build (~1 us/query); (3) ST-only prefetch on x86 (H63, ~x1.005 HM
+alone); (4) re-sweeping the NEON tile floor once H68/H70 move the
+per-block cost; (5) two interleaved streams per worker at arm MT nq=1
+(H36's shape, refuted in round 1). Picked (1): same mechanism as H70,
+exact, two cells, and it lands in the same candidate.
+
+**H71:** `score_4bit_block_neon` (the 2-bit single-query kernel) flushes
+its four `u16x8` accumulators once per block through `ushll` + `ucvtf`
+— 8 + 8 issue slots on the 2/cycle and 1/cycle rows, in a ~700-cycle
+block: ~1.5-2% of the arm nq=1 cells. Replaced by the H70 form (zip with
+zero, OR into 2^23's mantissa, subtract 2^23), bit-identical for values
+below 2^16. Queued on arm behind H70, smoked against `h70` on nq1_st,
+nq1_mt with nq100_mt as the control.
+
+## H72 — a 2-bit SMMLA batched kernel for arm — THE BIG BET, PRE-REGISTERED
+
+Ryan's call: pursue the formulation change under a recall-equivalence
+gate for this hypothesis (recall@10 within 0.001 of the LUT path on the
+frozen queries), since the LUT path already rounds every two-dimension
+partial product to 7 bits and the permute-dot path rounds only the
+query to 8 bits and accumulates exactly, which measured as a recall gain
+at 4 bits.
+
+**Why it can be large.** On Axion the shipped 4-bit SMMLA (vm8) path
+scans 100 queries over *twice* the bytes in 99.6 ms against the 2-bit
+LUT's 134 ms (P1). Round 1's P5 probe that "closed" this reached only
+102 G(q.dim)/s for SMMLA against the shipped 4-bit kernel's 154 on the
+same box — a probe-fidelity gap of the kind H53 exposed on x86.
+
+**Design space, priced by op count per (vector x dim), shared cost
+amortised over the batch:**
+
+| layout | shared ops / v.d | per-query ops / q.v.d | nq=1 LUT cost |
+|---|---|---|---|
+| sequential (shipped) + in-register 8x16 transpose | 0.33 | 0.031 | none |
+| pair-interleaved (two adjacent groups per vector) | 0.22 | 0.031 | LD2 or 2 UZP per 32 B |
+| vm8 (eight adjacent groups per vector; TBL output *is* the B row) | 0.09 | 0.031 | 8-way UZP tree |
+| LUT (reference) | 0.047 | 0.078 | — |
+
+The layout is decided at load (`pack::native_transform`), so a new arm
+2-bit native layout is contained to `pack.rs` and the kernels; the file
+format is untouched.
+
+**Probe (`smmla2_probe.c`, faithful transcriptions; M3 Max first, Axion
+queued):**
+
+| variant | M3 G(q.dim)/s | vs LUT4 |
+|---|---|---|
+| LUT 4-query, sequential | 166.5 | — |
+| SMMLA pair, nq=8 / 12 | 154 / 166 | x0.92 / x1.00 |
+| **SMMLA vm8, nq=8 / 12** | **178.5 / 187.6** | **x1.07 / x1.13** |
+| LUT nq=1 sequential | 128 | — |
+| LUT nq=1 pair (LD2 / UZP) | 117 / 116 | x0.92 / x0.90 |
+| LUT nq=1 vm8 (UZP tree) | 92 | x0.72 |
+
+The M3 is not the target: Apple runs TBL at full rate where round 1
+found P5's arm numbers reversed on it, and its SMMLA rate is its own. On
+Axion the ISA table has SMMLA at 3.48/cycle and TBL/ZIP at 4, which
+prices vm8 at nq=8 near x1.7 over the LUT. What is already clear from
+both arithmetic and the M3: **the transpose-free layout is the one that
+wins, and it costs nq=1** — the single-query LUT kernel has to
+de-interleave eight groups per vector. Under the goal's no-regression
+rule that is a trade to put in front of Ryan with the Axion numbers,
+not one to make silently: at the M3's ratios the 8-cell HM still rises
+(~x1.07 at nq=100 x1.13 / nq=1 x0.72... no: at those ratios it *falls*
+— 8/(4 + 2/0.72 + 2/1.13) = 0.97), so the bet only pays if Axion's
+SMMLA gain is much larger than the M3's, as the 4-bit evidence says.
+
+**H72 implementation (in the worktree, behind `TURBOVEC_2BIT_VM8=1`).**
+The 4-bit `vm8` layout machinery is reused unchanged (`vm8_for` now
+admits 2 bits under the toggle; the load-time transform and byte index
+are width-agnostic). Added: `build_permute_dot_2bit` (i8 query in
+dimension order, two 16-entry level tables), `QueryNeonLut::pd2`,
+`build_smmla_a_vm8_2bit` (A operands in the field order the four TBLs
+produce), `score_block_smmla_vm8_2bit::<NQ, NP>` (the 4-bit vm8 kernel
+with four fields per byte), and `score_2bit_block_vm8_neon`, the
+single-query LUT kernel reading vm8 through a three-level UZP tree so
+nq=1 and batch tails stay on the exact LUT arithmetic. Dispatch: with
+`pd2` present, batches of 12/8/4 take the SMMLA kernel; nq=1 and tails
+take the vm8 LUT kernel. Gate scripts: `recall_h72.py` (ids per mode on
+the harness index, 500 queries) and `recall_h72_gt.py` (exact
+inner-product truth on the same seeded base; recall@10 of each mode and
+their top-10 overlap).
+
+## H69 — x86 chain: soaks, sweep, parity, tests
+
+**x86 soak vs `h60`, the climb HEAD** (2 balanced ABBA passes,
+`data/r2_h69/x86_*`):
+
+| cell | h60 | h69 | |
+|---|---|---|---|
+| nq100_mt | 15.823 | 15.311 | **x1.0335** — every h69 pass (15.31-15.67) below every h60 pass (15.82-16.18) |
+| nq1_mt | 0.421 | 0.402 | **x1.0473** — every h69 pass (0.402-0.407) below every h60 pass (0.421-0.427) |
+| nq100_st | 56.439 | 54.797 | x1.0300 (both builds in the fast regime this time) |
+| nq1_st | 1.287 | 1.289 | x0.9986 |
+
+x86 soak vs `base2` (3 passes): nq100_st x1.319, nq100_mt x1.505,
+nq1_mt x1.035, nq1_st x0.977 (the regime cell drawing slow; the direct
+HEAD comparison above has it flat). Paired sweep: **no point below
+0.97, worst nq1_st x0.998** — the x0.785 H65b's sweep printed for that
+point did not reproduce, as P43 (queued) will also say. Parity digests
+identical. `cargo test`: 40 suites green on the box. 4-bit observation
+recorded (`x86_h69_obs4_h69.json`).
+
+x86 4-cell HM ~x1.028 against HEAD; the 8-cell verdict waits on the arm
+H69 soak in progress.
+
+## P43 — the sweep's nq1_st x0.785, re-measured in isolation (probe; not counted)
+
+Six ABBA passes of nq1_st alone, `h60` vs `h65b`, same box, same hour:
+h60 1.289-1.360, h65b 1.278-1.377; **x1.009 on mins, x0.994 on means**.
+The paired sweep's x0.785 for this point did not exist: it was the
+regime cell switching modes between the two halves of a pair, which the
+per-pair ratio cannot distinguish from a change. The H69 sweep read the
+same point at x0.998. Consequence for the instrument: on x86 the nq1_st
+sweep point is uninformative below ~x0.8 either way, and any reading
+there must be re-measured in isolation before it means anything.
+
+**H72, first local run (M3 Max).** With the toggle off: 40 suites green
+(the layout gate is inert). With it on: the single-query vm8 LUT kernel
+is **bit-identical** to the sequential kernel at nq=1 and nq=2 (same ids,
+same scores to the last digit), which validates the layout transform and
+the UZP tree; the batched SMMLA path returned garbage (recall 0, no
+overlap with the LUT's top-10) and failed one calibration test. Cause: I
+had the four 2-bit fields the wrong way round — the stored byte is
+big-endian in dimensions (bits 7:6 = dim 4g, 5:4 = 4g+1, 3:2 = 4g+2,
+1:0 = 4g+3, from `pack::build_extract_lut`), so the high nibble carries
+the first two dims. Swapping the nibble roles fixes it: on a 4,096-vector
+index the SMMLA path returns the LUT's top-4 (two adjacent entries
+swapped, scores within 0.05%) and a near-tie at rank 5 — quantisation-
+level differences, i.e. the recall gate's business. M3 speed, before the
+fix (kernel shape unchanged by it): nq100_st x1.070, nq100_mt x1.016,
+nq1_st x0.721, nq1_mt x0.863 — the probe's picture. Axion decides.
+
+**H72, second local run (mapping fixed).** `cargo test`: 40 suites green
+with the toggle off *and* on. Recall gate on the harness index (200k
+uniform vectors, 500 queries, exact cosine truth): **LUT 0.0678, SMMLA
+0.0686 (+0.0008), top-10 overlap 92.2%.** Uniform random data has almost
+no neighbour structure so the absolute recall is low for both; the
+equivalence is the delta and the overlap. M3 speed (toggle A/B, min of
+3 processes): nq100_st x1.071, nq100_mt x0.989, nq1_st x0.703, nq1_mt
+x0.949 — the M3's SMMLA rate limits the batched gain and nq=1 pays the
+UZP tree; Axion's numbers, where the ISA rates differ, are the ones
+that count and are queued.
+
+**H72 recall gate on real data** (`recall_h72_real.py`, the official
+`recall_d1536_4bit.py` methodology at 2 bits: seed 42, normalised
+database and queries, exact top-1 truth, recall@1 at k, TQ and
+calibrated TQ+). Local, `emb-mpnet768.npy` (768-d, 40k database, 1000
+queries):
+
+| k | LUT TQ | SMMLA TQ | LUT TQ+ | SMMLA TQ+ |
+|---|---|---|---|---|
+| 1 | 0.8530 | 0.8520 | 0.8620 | 0.8640 |
+| 2 | 0.9650 | 0.9640 | 0.9630 | 0.9630 |
+| 4 | 0.9950 | 0.9940 | 0.9970 | 0.9960 |
+| 8+ | 1.0000 | 1.0000 | 1.0000 | 1.0000 |
+
+Equivalent to within +/-0.002 at every k, in both calibration modes.
+The OpenAI-1536 run (100k / 1000, the suite's own dataset) follows
+locally and on Axion.
+
+**H72 recall gate, OpenAI-1536** (the suite's dataset and methodology,
+100k database / 1000 queries, local):
+
+| k | LUT TQ | SMMLA TQ | LUT TQ+ | SMMLA TQ+ |
+|---|---|---|---|---|
+| 1 | 0.8880 | 0.8890 | 0.9010 | 0.9040 |
+| 2 | 0.9770 | 0.9760 | 0.9880 | 0.9890 |
+| 4 | 0.9990 | 1.0000 | 0.9990 | 0.9990 |
+| 8+ | 1.0000 | 1.0000 | 1.0000 | 1.0000 |
+
+**Recall equivalence holds** — the SMMLA path is +0.001 to +0.003 at
+k=1 in both modes, as the arithmetic (one 8-bit query rounding instead
+of 7-bit pair-product rounding) predicted. The gate is met on both real
+datasets; what remains is speed on Axion.
+
+**nq=1 on vm8, more shapes (M3, probe variants 10/11):** LD4 x2 + one
+UZP level 90.7 G (x0.70 vs sequential 128.8) — no better than the UZP
+tree's 93.7; SMMLA with the query duplicated (the 4-bit path's nq=1
+shape) 43.2 G (x0.34). A TBL4-based direct lookup on the vm8 bytes
+prices at ~0.31 ops/v.d against the tree's 0.155 and was not built. So
+on this silicon the single-query cost of the batched layout is ~30%
+however the bytes are read; Axion's rates (TBL/UZP 4/cycle, SMMLA
+3.48) are queued as variants 3/9/10/11 behind the H72 recall run.
+
+## H68 — arm smoke vs `h67` (one ABBA round; the second was lost to a
+## queue accident that also stalled the arm box ~90 min until the marker was written by hand)
+
+```
+h67  nq100_st 130.683  nq100_mt 16.932  nq1_mt 0.256
+h68  nq100_st 129.277  nq100_mt 16.765  nq1_mt 0.253
+h68  nq100_st 129.280  nq100_mt 16.751  nq1_mt 0.256
+h67  nq100_st 130.859  nq100_mt 16.917  nq1_mt 0.256
+```
+
+nq100_st **x1.011**, nq100_mt **x1.010**, both h68 samples below both
+h67 samples on each; nq1_mt flat (untouched path). Parity identical. As
+predicted: ~1% each, the arm call being cheaper than the x86 one H60
+removed. Folded into H69, whose arm chain is now running.
+
+## AMX for x86 nq=100 — disposition (not counted; not built)
+
+Round 1 left AMX as "the one formulation left standing" for the x86
+nq=100 cells. It was in fact built and measured in the 4-bit climb
+(LOG_search.md, H99): a correct `TDPBSSD` scan reached **parity** with the
+4-bit VNNI kernel (208 Gmac/s), and the attribution probe found the
+mechanism — the tile file has no renaming, so each `tileloadd` serialises
+behind the `tdpbssd` reading that tile, and a 768-dim dot product is 12
+operand reloads per output tile in every loop arrangement that keeps the
+accumulators in tiles. Even deleting the A reload (wrong answers, timing
+only) reached x1.48. At 2 bits the picture is worse: the B operand must be
+unpacked to i8 (four levels per code byte) and staged through memory for
+`TILELOADD`, and the 2-bit LUT kernel after H53-H60 runs at ~280
+G(q.dim)/s, above the AMX prototype's ceiling. Closed on this hardware
+by H99's measurement; not re-attempted.
+
+## H69 — arm soak and the 8-cell authority: WIN vs HEAD (x1.0245), gates pending
+
+**Arm soak vs `base2` (the arm HEAD)**, 3 balanced ABBA passes,
+`data/r2_h69/arm_*`:
+
+| cell | base2 | h69 | |
+|---|---|---|---|
+| nq100_st | 139.582 | 133.723 | **x1.0438** — every h69 pass (133.7-140.0) below every base2 pass (139.6-143.7) |
+| nq100_mt | 17.322 | 16.936 | **x1.0228** — every h69 pass (16.94-17.22) below every base2 pass (17.32-17.50) |
+| nq1_mt | 0.271 | 0.264 | **x1.0261** |
+| nq1_st | 1.633 | 1.638 | x0.9967 |
+
+Parity digests identical on arm (and on x86, above).
+
+**Authority against the climb HEAD** (arm from this soak, x86 from the
+h60 soak):
+
+```
+cell            arm        x86
+  nq1_st       x0.9967    x0.9986
+  nq1_mt       x1.0261    x1.0473
+  nq100_st     x1.0438    x1.0300
+  nq100_mt     x1.0228    x1.0335
+  arm 4-cell HM  x1.0221
+  x86 4-cell HM  x1.0270
+  8-cell HM      x1.0245   worst cell nq1_st_arm x0.9967
+VERDICT: WIN
+```
+
+Six of eight cells up, the two nq1_st cells flat inside their bands.
+Cumulative against the pinned 1.0.0 baseline: 8-cell HM x1.1105. Lands
+as **win #4** once the arm sweep and `cargo test` in the running chain
+report (x86's already have).
+
+## H69 — landed. VERDICT: WIN vs climb HEAD — round-2 win #4 (8-cell HM x1.0245)
+
+Arm gates: paired sweep, 44 points, **none below 0.97** (worst nq11_st
+x0.972); `cargo test -p turbovec` 40 suites green on the Axion box;
+4-bit observation recorded (`arm_h69_obs4_h69.json`). x86 gates in the
+entry above. Parity identical on both arches at both widths.
+
+The bundle is three exact changes to fixed cost: H65b (x86's libm
+`roundf` per LUT entry replaced by a bit-identical `trunc` form; arm
+keeps `frinta`), H67 (the 2-bit LUT built from 4 + 4 products in the
+original summation order), H68 (the arm block top-k early exit inline).
+Cumulative against the pinned 1.0.0 baseline: 8-cell HM **x1.1105**;
+x86 nq100_st x1.32, nq100_mt x1.51, arm nq100_st x1.04.
+
+Committed on `perf/2bit-hillclimb-2`. **Non-win count: 0/20.**
+
+## H70 — exact magic-number flush, arm 4-query kernel — marginal, NOT PROMOTED (non-win 1/20)
+
+Axion, 2 ABBA rounds vs `h69`:
+
+| cell | h69 | h70 | |
+|---|---|---|---|
+| nq100_st | 143.3-144.1 | 143.0-144.2 | x1.002 (min) / x1.001 (mean) — flat |
+| nq100_mt | 17.34-17.64 | 17.17-17.50 | x1.010 (min) / x1.006 (mean) — ranges overlap |
+
+Parity identical. The prediction (2-3%) priced the flush at its issue
+slots — 8 `ushll` at 2/cycle and 8 `ucvtf` at 1/cycle per query per
+block — but the flush sits once per block behind a 192-group loop with
+plenty of independent work, and the out-of-order window hides it: the
+slow rows cost issue slots the loop was not short of. Real at most ~1%
+on one cell, cannot reach the bar; reverted. (H71, the same change in
+the nq=1 kernel where the flush is a larger share of a shorter block,
+is queued and gets its own reading.)
+
+**Verdict: non-win 1/20.**
+
+## H71 — magic-number flush, arm nq=1 kernel — flat, NOT PROMOTED (non-win 2/20)
+
+Axion, 2 rounds vs `h70`: nq1_st x0.998, nq1_mt x1.012 (inside its 1.9%
+band), nq100_mt x0.998 (control). Same lesson as H70: the flush's slow
+issue rows are hidden by the out-of-order window even in the short nq=1
+block. Reverted. **Verdict: non-win 2/20.**
+
+## H72 — Axion: the probe, the kernel, the gates, and the trade
+
+**Probe (`smmla2_probe.c`, two runs, G(q.dim)/s):**
+
+| variant | Axion | vs LUT4 (124) |
+|---|---|---|
+| LUT 4-query, sequential | 121-124 | — |
+| SMMLA pair, nq=8 / 12 | 157 / 162 | x1.27 / x1.30 |
+| **SMMLA vm8, nq=8** | **183-185** | **x1.49** |
+| SMMLA vm8, nq=12 | 159-161 | x1.30 (spills) |
+| LUT nq=1 sequential | 88-93 | — |
+| LUT nq=1 pair (LD2 / UZP) | 77-83 / 77-81 | x0.88 |
+| LUT nq=1 vm8 UZP tree | 67 | x0.73 |
+| LUT nq=1 vm8 LD4 x2 | 58-59 | x0.64 |
+| SMMLA nq=1 duplicated query | 61-63 | x0.67 |
+
+**The kernel in the crate, toggle A/B on the harness index, two ABBA
+rounds** (`smoke_env.sh`, same `.so`, layout chosen at load):
+
+| cell | LUT (HEAD) | SMMLA/vm8 | |
+|---|---|---|---|
+| nq100_st | 129.6-135.4 | 75.0-78.1 | **x1.727** |
+| nq100_mt | 16.87-17.12 | 10.06-10.17 | **x1.676** |
+| nq1_st | 1.622-1.682 | 2.513-2.543 | x0.645 |
+| nq1_mt | 0.262-0.277 | 0.372-0.385 | x0.704 |
+
+The batched gain in the real kernel (x1.7) exceeds the probe's x1.49:
+the crate kernel runs 8 parts x 2 accumulators per pair against the
+probe's 4 x 4 and the batch dispatch takes 12/8/4-wide chunks. The nq=1
+loss in the real cell (x0.65) is worse than the probe's x0.73 — the
+16-register group set of the UZP tree plus the LUT step likely spills.
+
+**Gates.** Recall on Axion identical to the local runs: OpenAI-1536
+recall@1 TQ 0.888 -> 0.889, TQ+ 0.901 -> 0.904; uniform harness +0.0008
+with 92% top-10 overlap. Parity digests differ at 2 bits (by design) and
+match at 4 bits. `cargo test` 40/40 in both modes.
+
+**Verdict under the goal as written: NOT A WIN** — two cells regress by
+30-35% and the 8-cell HM falls to ~0.98 even with the other two up x1.7.
+As a *product* change it is a real 1.7x for batched search on arm at an
+unchanged recall, which is why it is committed behind
+`TURBOVEC_2BIT_VM8=1` (inert by default) rather than discarded. Options
+put to Ryan: (1) opt-in layout, default unchanged; (2) default on,
+accept the nq=1 cost; (3) the pair layout as a compromise (x1.28 /
+x0.88 from the probe). A better nq=1 kernel on vm8 is the open follow-up
+if (2) is chosen: halving the live group set (process each 16-vector
+half straight after its own UZP tree) is the first thing to try.
+
+## Dispositions from existing measurements (non-wins 3, 4, 5 / 20) and H79 — PRE-REGISTERED
+
+Counted, per round 1's convention for candidates a measurement already
+answers:
+
+- **H72 as default (non-win 3/20):** measured above — x1.73 / x1.68 on
+  the arm nq=100 cells against x0.65 / x0.70 at nq=1; fails the
+  no-regression rule. Kept opt-in.
+- **Pair layout (non-win 4/20):** the Axion probe has it at x1.27-1.30
+  for nq=100 and x0.88 at nq=1 (LD2 or UZP); a regression by
+  construction on two cells. Not built.
+- **x86 ST-only prefetch, H63 (non-win 5/20):** H61 measured +4.0% on
+  nq100_st with MT untouched by the gate; one cell at +4% is x1.005 on
+  the 8-cell HM. Not built.
+
+**H79 — four code streams per table load in the x86 nq=1 kernel.** P40
+put both x86 nq=1 cells on L3 bandwidth (30 and 93 GB/s against a DRAM
+tool's 19 and 53), and H34's two-block interleave was the last thing to
+move them. More independent streams per `vpermb` table load is the only
+lever the port count leaves; four blocks is 8 accumulators + 2 tables +
+per-block index pairs, inside the register file. Exact by construction
+(same dpbusd order per accumulator). Queued on x86 behind the capstone,
+smoked against `h69` on nq1_st, nq1_mt with nq100_mt as the control.
+
+## Capstone — the cumulative round-2 build vs the pinned 1.0.0 baseline, one session per box
+
+Both boxes, `base2` vs `h69` (H53+H56+H60+H69; H72 present but inert
+without its toggle), 3 balanced ABBA passes each, min per label, scored
+by `whm_2bit.py` (`data/r2_capstone/`):
+
+```
+cell            arm        x86
+  nq1_st       x0.9948    x1.0232
+  nq1_mt       x1.0408    x1.0488
+  nq100_st     x1.0189    x1.4888
+  nq100_mt     x1.0173    x1.4962
+  arm 4-cell HM  x1.0177
+  x86 4-cell HM  x1.2229
+  8-cell HM      x1.1109   worst cell nq1_st_arm x0.9948
+VERDICT: WIN
+```
+
+Round 2 to date: **8-cell HM x1.111 over 1.0.0**, x86 nq=100 cells
+~x1.49, arm cells x1.02-1.04, no cell below the floor. The capstone
+sweeps (44 paired points per box) are running and will be recorded
+under this entry.
+
+## H79 — four code streams in the x86 nq=1 kernel — REFUTED (non-win 6/20)
+
+x86, 2 rounds vs `h69`: nq1_st 1.296-1.484 vs 1.376-1.410 (x0.94 on
+mins, x1.00 on means — the regime cell), nq1_mt 0.418-0.426 vs
+0.417-0.435 (flat), control nq100_mt x0.98/x0.99 (drift). More streams
+per table load buys nothing: at 30 GB/s from L3 the two-stream kernel
+already keeps enough misses in flight, and the extra index work is not
+free. Reverted. **Verdict: non-win 6/20.**
+
+**Capstone sweep, x86:** 44 paired points, none below 0.97 (min nq1_st
+x1.024); nq=2/4/6/8 ST x1.34/1.26/1.43/1.45, N=200k x1.26 ST / x1.52 MT.
+Arm's sweep to follow.
+
+## H81 / H82 (x86) and H84 / H85 (arm) — constant sweeps at the round-2 geometry — PRE-REGISTERED
+
+Cheap, one build and one smoke each, run as one chain per box:
+
+- **H81** `TILES_PER_THREAD` 32 -> 16 on x86: batch 6 makes 17 quads,
+  so the block axis now splits into 16 ranges (272 tiles); H16 found
+  the constant inert at the old geometry. Cell: nq100_mt.
+- **H82** x86 nq=1 prefetch distance 8 -> 16 quads: the cells are
+  L3-served (P40) rather than DRAM-served as when H21 self-confirmed 8.
+  Cells: nq1_st, nq1_mt.
+- **H84** `TILES_PER_THREAD_NEON` 64 -> 96 on arm: H50's direction
+  (fewer, longer ranges won by 0.33%) at the post-H69 per-block cost.
+  Cells: nq100_mt, nq1_mt.
+- **H85** the 2-bit NEON tile floor `MIN_TILE_BLOCKS_NEON * 2` -> `* 1`
+  (H14's win, re-asked now that the block is cheaper). Cell: nq100_mt.
+
+Expected: flat. Each is a constant round 1 tuned at a geometry that has
+since changed by 20-50%, which is the one honest reason to re-ask.
+
+**Capstone sweep, arm:** 44 paired points; one below 0.97 — **nq13_mt
+x0.953** — the rest x1.01-1.03 (nq=2/4/6/8 ST x1.02/1.01/1.02/1.03,
+N=200k x1.01 ST / x1.02 MT). Nothing in the arm changes (H67's LUT
+build, H68's early exit) is specific to nq=13, and the instrument's
+no-op floor on this box (P4) has 13-23 of 88 points past 3%. Re-measured
+in isolation (P44, six ABBA passes) rather than argued away.
+
+## H81 / H82 / H84 / H85 — constant sweeps — all REFUTED (non-wins 7, 8, 9, 10 / 20)
+
+Two ABBA rounds each vs `h69`:
+
+| | cell | h69 | cand | verdict |
+|---|---|---|---|---|
+| H81 x86 `TILES_PER_THREAD` 32->16 | nq100_mt | 15.93-16.17 | 15.98-16.64 | x0.997 (min) / x0.986 (mean) — worse |
+| H82 x86 nq=1 prefetch 8->16 quads | nq1_st | 1.29-1.31 (+1 outlier) | 1.29-1.38 | x1.00 on mins; unresolved |
+| | nq1_mt | 0.415-0.422 | 0.409-0.446 | x1.015 min / x0.972 mean — noise |
+| H84 arm `TILES_PER_THREAD_NEON` 64->96 | nq100_mt | 17.28-17.41 | 17.19-17.47 | x1.005 / x1.002 — inside band |
+| | nq1_mt | 0.274-0.280 | 0.274-0.283 | flat |
+| H85 arm 2-bit tile floor x2 -> x1 | nq100_mt | 17.28-17.41 | 17.71-17.80 | **x0.976** — H14's floor still right |
+
+Every round-1 constant re-asked at the round-2 geometry answers the
+same way it did. **Verdicts: non-wins 7-10 of 20.**
+
+## H86 — VNNI batch width 4 at MT — PRE-REGISTERED (x86)
+
+P36 chose width 6 on the ST cell, where one thread owns the 48 KB L1D
+and the 36 KB LUT set fits. At MT the harness runs 8 workers on 4
+cores, so two hyperthreads share each L1D: two 36 KB sets do not fit
+where two 24 KB sets (width 4) do. Mechanism is the same L1 term that
+made 10 lose (H55); the prediction is a few percent on nq100_mt and
+nothing at ST. `VNNI_BATCH` becomes 4 when the pool has more than one
+thread. Cell: nq100_mt, with nq100_st as the untouched control.
+
+## P44 — the arm sweep's nq13_mt x0.953, re-measured in isolation (probe; not counted)
+
+Six ABBA passes of nq=13 MT alone on Axion: base2 2.659-2.676,
+h69 2.462-2.624 — **x1.080 on mins, x1.041 on means**, every h69 pass
+below every base2 pass. The paired sweep's x0.953 for that point was
+the instrument (P4's floor), and the capstone stands with no point
+regressing on either arch.
+
+## H86 — VNNI batch width 4 at MT — REFUTED (non-win 11/20)
+
+x86, 2 rounds vs `h69`: nq100_mt 16.03-16.32 vs 17.49-17.85 —
+**x0.917** on mins, every h86 pass above every h69 pass; nq100_st
+(untouched by the gate) x0.96-0.97 on a drifting session. The shared
+L1D between hyperthreads is not the binding term at MT; the 25 sweeps
+of the codes that width 4 needs against 17 are. Reverted.
+**Verdict: non-win 11/20.**
+
+## Disposition — per-tile allocation reuse (non-win 12/20)
+
+P42 priced the per-query non-LUT work at ~9 us on Axion and ~10 us on
+x86 at ST, parallel at MT; the tile loop allocates its heaps and
+reference vectors per (quad, range) tile, 272-500 tiles per nq=100
+search, ~1-2% of the MT cells and nothing at ST (one range). At most
+~x1.007 on the 8-cell HM; not built.
+
+## H87 / H89 / H90 / H95 — last cheap constants — PRE-REGISTERED
+
+- **H87** x86 `TILES_PER_THREAD` 32 -> 64 (H81's other direction).
+- **H90** x86 nq=1 prefetch 8 -> 4 quads (H82's other direction; the
+  cells are L3-served, a shorter lookahead may waste less).
+- **H95** x86 nq=1 without the two-block interleave (`n_fours`/pairs
+  bypassed, every block single-stream): H34 won it against DRAM;
+  against L3 the second stream may be dead weight.
+- **H89** arm nq=1 MT: two block ranges per thread instead of one
+  (H103 refuted this at 4 bits from DRAM; at 2 bits the cell is at 85%
+  of supply).
+
+## H87 / H90 / H95 / H89 — REFUTED or marginal (non-wins 13, 14, 15, 16 / 20)
+
+Two ABBA rounds each vs `h69` (three for H89):
+
+| | cell | h69 | cand | verdict |
+|---|---|---|---|---|
+| H87 x86 `TILES_PER_THREAD` 32->64 | nq100_mt | 15.66-16.59 | 15.60-16.16 | x1.003 min / x1.012 mean — ranges overlap, flat |
+| H90 x86 nq=1 prefetch 8->4 | nq1_st | 1.30-1.78 | 1.43-1.78 | regime cell, unresolved |
+| | nq1_mt | 0.409-0.436 | 0.414-0.424 | x0.988 / x1.006 — flat |
+| H95 x86 nq=1 single-stream (no interleave, no prefetch) | nq1_st | 1.30-1.78 | 1.50-1.61 | x0.87 min / x0.97 mean — unresolved |
+| | nq1_mt | 0.409-0.436 | 0.404-0.414 | x1.012 / x1.027 — small, one cell (~x1.003 HM) |
+| H89 arm nq=1 MT, two ranges per thread | nq1_mt | 0.273-0.280 | 0.296-0.300 | **x0.922** — H103's verdict holds at 2 bits |
+
+H95's nq1_mt reading is the only positive number and cannot reach the
+bar alone; recorded as a term for anyone revisiting the x86 nq=1 kernel
+against an L3-resident index. **Verdicts: non-wins 13-16 of 20.**
+
+## H97 / H98 — last two smokes, and two dispositions — PRE-REGISTERED
+
+- **H97** x86 `MIN_TILE_BLOCKS_X86` 3x -> 2x the shared floor (the MT
+  tile floor at the batch-6 quad count).
+- **H98** arm single-query range stride floor 64 -> 128 blocks (longer
+  per-worker streams for the 85%-of-supply nq1_mt cell).
+- **Disposition, x86 nq=100 tail as 5+5 instead of 6+4 (non-win 19/20):**
+  P36 has widths 4 and 5 within 0.4% of each other per query; nothing to
+  gain.
+- **Disposition, arm LUT batch 4 -> 2 at MT (non-win 20/20 if H97/H98
+  fail):** halves the amortisation and doubles the sweeps; H12 measured
+  the wider direction and the arithmetic forbids the narrower.
+
+## H97 / H98 — REFUTED or marginal (non-wins 17, 18 / 20); dispositions 19, 20 — ROUND 2 CLOSED
+
+| | cell | h69 | cand | verdict |
+|---|---|---|---|---|
+| H97 x86 `MIN_TILE_BLOCKS_X86` 3x -> 2x | nq100_mt | 15.84-16.69 | 15.72-15.96 | x1.008 min / x1.025 mean on a session whose control spread (5%) exceeds the cell's band; at most ~2% on one cell, ~x1.003 on the HM. Not promoted. |
+| H98 arm nq=1 range stride floor 64 -> 128 | nq1_mt | 0.271-0.284 | 0.272-0.282 | x0.996 / x1.004 — flat |
+
+With the two dispositions registered above (x86 tail 5+5; arm LUT
+batch 2), **20 consecutive non-wins: round 2 is done.**
+
+### Round 2 — closing summary
+
+Baseline: main 1.0.0 (ccab9f32), 2026-09-06. Branch
+`perf/2bit-hillclimb-2`, worktree `~/git/tv-2bit-hc`.
+
+**Exact wins landed (parity-identical, sweeps clean, tests green):**
+
+| win | change | effect (vs HEAD at the time) |
+|---|---|---|
+| H53 | const-generic batch width for the x86 VNNI kernel (32 branch pairs + spills per quad removed) | x86 nq100 x1.27 / x1.36 |
+| H56 | VNNI batch width 6 (P36 measured the knee) | x86 nq100 +5-6% |
+| H60 | inline the block epilogue's early exit (six 13-arg calls per block removed) | x86 nq100 +5% |
+| H69 | prep + epilogue fixed costs: exact trunc rounding (x86), 4+4-product LUT build, arm top-k early exit | six cells +1-5% |
+
+**Capstone, cumulative build vs 1.0.0, one session per box:** 8-cell HM
+**x1.111** (WIN); x86 nq100_st x1.49, nq100_mt x1.50, nq1 cells
+x1.02-1.05; arm cells x1.02-1.04, nq1_st x0.995. Sweeps clean on both
+arches (one arm point re-measured, P44).
+
+**The big bet, H72:** a 2-bit SMMLA kernel on the vm8 layout for arm,
+allowed under a recall-equivalence gate. Correct; recall unchanged or
+slightly better on real data; on Axion **x1.73 / x1.68 on the nq=100
+cells and x0.65 / x0.70 at nq=1.** Not a win under the no-regression
+rule; committed inert behind `TURBOVEC_2BIT_VM8=1` with the trade
+recorded for Ryan's decision (opt-in layout, default-on, or the pair
+layout at x1.28 / x0.88).
+
+**Closed by measurement this round:** AMX on x86 (H99 in the 4-bit
+log: no tile renaming), LUT re-fetch traffic (H64), wider/narrower VNNI
+batches (H55/H57/H58/H86), the arm flush conversions (H70/H71), every
+round-1 constant re-asked at the new geometry (H81-H98), and the x86
+nq=1 kernel's stream count and prefetch depth against an L3-resident
+index (H79/H82/H90/H95).
+
+**What a round 3 should start from:** (1) the H72 decision — if the
+batched layout ships by default, a better nq=1 kernel on vm8 (halve the
+live group set; the tree spills) is the first hypothesis; (2) x86
+nq100_st's regime switching (P37) is external to the guest and bounds
+what any further x86 work can show; (3) the arm LUT kernels are at the
+issue bound of their formulation (P24/P27), so arm gains beyond H72
+need a formulation change, which the recall gate now permits.
+
+---
+
+# Round 3 (2026-10-02)
+
+Goal in `GOAL_2bit_r3.md`. Baseline pinned at the round-2 HEAD (03fc2a2c).
+Branch `perf/2bit-hillclimb-3`. New this round: a result may be exact, or
+pass the probabilistic gate (>= 99.9% of queries return the exact scan's
+ids on real embeddings; returned scores are the exact 2-bit scores).
+
+## P45 — sign-plane shortlist: how large must it be? (probe; not counted)
+
+**Idea.** A 2-bit code is a sign bit and a magnitude bit. Scan only the
+sign plane (half the bytes, and a 16-entry lookup then covers four
+dimensions instead of two), keep a shortlist, rescore it at full 2-bit.
+
+**Probe.** `turbovec/src/plane_probe.rs` (ignored in-crate test) dumps the
+real codes, the rotated/calibrated queries and the exact top-100 from
+`search`; the offline analysis scores every vector from its sign bits alone
+(`scale_v * (m * q.sign + bias_q)`, m = the measured mean magnitude) and
+records, per query, the shortlist size needed to contain the exact top-k.
+OpenAI-1536, N=200k, 10,000 queries, real nested planes. The same probe
+run at 4 bits (top two bits as the coarse plane) is recorded as an
+observation.
+
+Miss rate (fraction of queries whose exact top-k is not wholly inside a
+shortlist of size S):
+
+| index | k | S=64 | S=128 | S=256 | S=512 | S=1024 | S=2048 | needed: p50 / p99.9 / max |
+|---|---|---|---|---|---|---|---|---|
+| 2-bit TQ | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 1 / 10 / 37 |
+| 2-bit TQ | 10 | 0.0025 | 0.0001 | 0 | 0 | 0 | 0 | 15 / 83 / 139 |
+| 2-bit TQ | 100 | 1 | 0.98 | 0.37 | 0.020 | 0.0002 | 0 | 228 / 874 / 1145 |
+| 2-bit TQ+ | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 1 / 12 / 19 |
+| 2-bit TQ+ | 10 | 0.0027 | 0.0001 | 0 | 0 | 0 | 0 | 15 / 77 / 132 |
+| 2-bit TQ+ | 100 | 1 | 0.98 | 0.35 | 0.015 | 0.0002 | 0 | 226 / 813 / 1285 |
+| 4-bit TQ | 10 | 0 | 0 | 0 | 0 | 0 | 0 | 12 / 38 / 57 |
+| 4-bit TQ | 100 | 1 | 0.85 | 0.014 | 0 | 0 | 0 | 153 / 347 / 387 |
+| 4-bit TQ+ | 10 | 0 | 0 | 0 | 0 | 0 | 0 | 12 / 33 / 46 |
+| 4-bit TQ+ | 100 | 1 | 0.82 | 0.007 | 0 | 0 | 0 | 148 / 249 / 392 |
+
+**Reading.** At k=10 a sign-plane shortlist of 128 already meets the 99.9%
+gate (1 query in 10,000 misses) and 256 misses none of 10,000; k=100 needs
+about 2048, i.e. roughly 15-20x k in both cases, 1% of N at worst. The
+float model of the exact score matched the returned scores to 4e-3
+relative, so the dim/field mapping is right. One dataset so far; the gate
+needs OpenAI-3072 and mpnet-768 too.
+
+**Provenance caveat.** This run was made on Ryan's Mac before the
+boxes-only rule was added to the goal. It is a recall measurement, not a
+timing, so the machine does not change it; it is re-run on the rig with
+the other two datasets before anything is gated on it.
+
+**Next.** H99 (pre-registered below).
+
+## H99 (pre-registered) — sign-plane first pass + exact 2-bit rerank
+
+**Hypothesis.** The existing LUT kernels score nibbles against 16-entry
+tables and do not care what a nibble means. Fed a sign plane (8 dims per
+byte) with tables built over sign patterns, they scan `dim/8` byte-groups
+instead of `dim/4`: half the bytes and half the lookups, on both arches,
+ST and MT. The shortlist (S = f(k), from P45) is rescored from the full
+codes with the exact 2-bit arithmetic, so returned scores are unchanged.
+RAM is unchanged: the blocked cache holds the sign plane and the magnitude
+plane in place of the interleaved 2-bit bytes.
+
+**Prediction.** nq=1 cells (memory-bound, x86 at 98% of supply): toward
+x1.8-2.0 less the rerank (256 vectors x 192 bytes, random access, est.
+10-20 us, which matters most on nq1_mt at ~260 us). nq=100 cells
+(issue-bound): toward x1.6-1.9. 8-cell HM > x1.5.
+
+**Gate.** Probabilistic: P45's curve on three datasets, then ids compared
+against the exact scan in situ.
+
+## Rig note — round 3 runs on replacement VMs (2026-10-02)
+
+Both round-2 search boxes hit a GCP stockout (`c4a-standard-8` in
+us-central1-a, `c3-standard-8` in us-central1-c). Round 3 measures on:
+
+- **x86:** the same instance and disk, machine type changed to
+  `c3-highmem-8` (same Sapphire Rapids 8481C, 8 vCPU, more RAM).
+- **arm:** `turbovec-bench-arm-search-r3`, a `c4a-standard-8` clone of the
+  round-2 disk in us-central1-b (snapshot `tv-arm-search-r3`). Reach it
+  through IAP with the `gce_ed25519_tvbench` key; the `tvarm` alias still
+  names the stocked-out original.
+
+The baseline was re-established on these VMs from the round-2 HEAD
+(`r3base`): arm 1.65 / 0.26 / 131 / 16.9 ms (nq1_st, nq1_mt, nq100_st,
+nq100_mt), matching round 2's figures; x86 1.3-1.4 / 0.39-0.40 / 56-58 /
+15.6-16.0 ms. The x86 box spent its first hour in the slow single-thread
+regime P37 describes (nq1_st 3.3-3.5 ms, nq100_st 89-93 ms) and then
+returned to the fast one; ratios taken during the slow regime are not
+quoted below. Every score is a paired ABBA A/B on the same box in the
+same session.
+
+## H99 — sign-plane first pass + exact rerank — smoke history
+
+Built behind `TURBOVEC_2BIT_PLANES=1` (default off). Each step below was
+smoked ABBA against `r3base` on the box(es) named.
+
+**1. Prototype, sign plane as an extra buffer (+50% RAM), whole-block
+rerank, top-S heap (x86).** nq1_st faster, nq1_mt x0.69, nq100_mt x0.73.
+A phase profile (`TURBOVEC_PLANES_PROF`) put the loss on the heap: an
+exact scan at k=128 instead of k=10 costs +25 ms at nq100_st and
++0.3 ms at nq1_mt by itself — the O(k) rescan per insert.
+
+**2. Buffered collector.** A heap whose min-index slot holds
+`HEAP_BUFFERED` appends lanes above a threshold and, at capacity 2S,
+keeps the best S and raises the threshold; the merge selects in linear
+time instead of sorting. All four x86 cells at or above baseline.
+
+**3. Same RAM, planes interleaved per block (one buffer, each block's
+first half the sign bytes).** Passes on six cells, nq1_mt x0.87-0.90 on
+both arches. The interleave breaks the stream: on x86, nq1_st scans in
+1.02 ms against 0.76 ms for a contiguous plane.
+
+**4. Same RAM, two regions (`pack::planes_for`).** The cache becomes a
+contiguous *sign region* — blocked exactly like a code buffer with half
+the byte-groups, so the existing kernels scan it unchanged — and a *low
+region* holding each vector's low bits as one row. Load, add, patch,
+swap-remove, sync capture and save go through `pack::planes_*` helpers
+that convert at the boundary; the stored format is untouched. The rerank
+rebuilds each shortlisted vector's code bytes from the two regions and
+applies the exact kernels' arithmetic (x86: one multiply-add over the
+u32 sum; aarch64: a fused multiply-add per `FLUSH_EVERY` groups), so
+returned scores are the exact scan's bit for bit. Seven cells win; arm
+nq1_mt x0.94.
+
+**5. Sample-seeded threshold.** The collector cost 57 us (arm) and 69 us
+(x86) per single query in MT — each range ratchets its own top-S. A
+48-block strided sample of the sign region, scanned first, gives each
+query a starting threshold (the sample's r-th best, r set so about four
+shortlists' worth of the index lies above it); a query that comes back
+short is rescanned unseeded. Smoke, both boxes, min of two ABBA labels:
+
+| cell | x86 base | x86 planes | | arm base | arm planes | |
+|---|---|---|---|---|---|---|
+| nq1_st | 1.323-1.462 | 0.735-0.794 | ~x1.8 | 1.651-1.655 | 0.958-0.976 | ~x1.7 |
+| nq1_mt | 0.393-0.407 | 0.328-0.333 | ~x1.2 | 0.256-0.268 | 0.233-0.237 | ~x1.1 |
+| nq100_st | 56.98-58.26 | 40.23-40.49 | ~x1.43 | 131.4-132.6 | 78.16-78.19 | ~x1.69 |
+| nq100_mt | 15.55-15.99 | 12.02-12.09 | ~x1.31 | 16.85-17.15 | 11.69-11.73 | ~x1.45 |
+
+Phase split at nq=1 (us, best of 150): x86 ST prep 23 / sign table 10 /
+scan 673 / rerank 57; x86 MT 27 / 10 / 226 / 35; arm ST 14 / 6 / 914 /
+47; arm MT 15 / 7 / 174 / 24.
+
+Smoke passes on all eight cells. Gates and soak follow.
+
+## H99 — gates and soak. `whm_2bit.py` VERDICT: WIN — round-3 win #1 (8-cell HM x1.4076)
+
+Build `h99g` (commit "sample-seeded shortlist threshold"), planes on for
+the candidate label, `r3base` (round-2 HEAD) as the baseline.
+
+**Probabilistic gate, in situ** (`r3gate.py`: one build, the exact scan
+against planes on, 10,000 queries, real embeddings, both boxes — the two
+arches agree to the digit):
+
+| data | N | calib | k=1 | k=10 | k=100 | scores bitwise |
+|---|---|---|---|---|---|---|
+| OpenAI-1536 | 200k | no | 1.0000 | 1.0000 | 0.9999 | 1.000000 |
+| OpenAI-1536 | 200k | yes | 1.0000 | 1.0000 | 1.0000 | 1.000000 |
+| OpenAI-3072 | 200k | no | 1.0000 | 1.0000 | 1.0000 | 1.000000 |
+| OpenAI-3072 | 200k | yes | 1.0000 | 1.0000 | 1.0000 | 1.000000 |
+| mpnet-768 | 41k | no | 1.0000 | 0.9995 | 0.9996 | 1.000000 |
+| mpnet-768 | 41k | yes | 1.0000 | 0.9997 | 0.9998 | 1.000000 |
+
+Entries are the fraction of queries whose returned ids equal the exact
+scan's, in order. Shortlist S = max(128, 12.8 k). The instrument can
+fail: with S = k the same check reads 0.03-0.17 at k=10. Shortlists of
+1.5x and 2x that size read 1.0000 everywhere except mpnet k=10 (0.9999).
+Every returned score is the exact scan's bit pattern, on both arches.
+
+**`cargo test -p turbovec`**: green on both boxes with the toggle off and
+with `TURBOVEC_2BIT_PLANES=1`.
+
+**RAM**: the sign region and the low region together are the bytes of the
+code buffer they replace (`n_blocks * 32 * dim/8` + `n * dim/8` against
+`n_blocks * 32 * dim/4`); the threshold sample adds a fixed 48 blocks
+(~150 KB at dim 768) per index, independent of N.
+
+**Soak** (`r3soak.sh`, 2 balanced ABBA passes = 4 runs per label per box,
+each run `cells_2bit.py`'s min of nine; scored on the min across runs):
+
+```
+cell            arm        x86
+  nq1_st       x1.7382    x1.6886
+  nq1_mt       x1.0910    x1.1904
+  nq100_st     x1.6678    x1.4194
+  nq100_mt     x1.4444    x1.3109
+  arm 4-cell HM  x1.4369
+  x86 4-cell HM  x1.3795
+  8-cell HM      x1.4076   worst cell nq1_mt_arm x1.0910
+VERDICT: WIN
+```
+
+Per-run spreads: arm base nq1_mt 0.254-0.264, cand 0.233-0.243; x86 base
+nq100_st 55.5-59.9 (the P37 drift), cand 39.1-39.8.
+
+**What this is and is not.** It is opt-in (`TURBOVEC_2BIT_PLANES=1`,
+default off) and the stored format is unchanged. Results are exact with
+probability, not by construction: a top-k vector outside the sign-plane
+shortlist is missed. Masked searches take the same path with a plain
+top-S heap; a request whose shortlist would cover the index rescoring
+everything. Not yet covered: a test job that runs the suite with the
+toggle on in CI, dims where `dim/4` is not a multiple of 8 (they keep the
+classic layout), and the x86 kernels below VBMI/VNNI (same). Streak: 0.
+
+## H100 (pre-registered) — refine pass before the exact rescore
+
+**Hypothesis.** After H99 the exact rescore of 128 candidates is 57 us
+(x86) / 47 us (arm) per query ST — 18% of x86 nq100_st — because each
+candidate's sign bits are gathered back out of the blocked region. A
+2-bit level is `+-A +- B` (sign bit, low bit), so a candidate's exact
+score is `A * S + B * L` with `S` the sign-plane sum the scan already
+produced and `L` the same sum over its low row, which is one contiguous
+96 bytes read through the sign tables. That estimate ranks the shortlist
+well enough to send only the best max(32, 3k) to the exact rescore.
+
+**Prediction.** Rerank 57 -> ~25 us. x86 nq100_st +10%, x86 nq1_mt +6%,
+arm nq1_mt +5%, others +2-4%; 8-cell HM ~x1.04 over H99.
+
+**Gate.** Probabilistic, same instrument, plus a sweep of the rescore
+length to show where it starts to miss.
+
+## H100 — refine pass before the exact rescore — VERDICT: NOT A WIN (non-win 1/20)
+
+Three builds. `h100` (refine everywhere, serial): six cells up, x86
+nq1_mt 0.327 -> 0.34-0.36. `h100b` (both rerank phases parallel at nq=1):
+nq1_mt x0.97-0.98 on both arches — the second fork-join costs what the
+refine saves. `h100c` (refine for ST and batched searches; one query on a
+pool keeps H99's parallel rescore): smoke passes on all eight.
+
+**Gate (`h100c`, both boxes, same instrument).** With the default rescore
+length max(32, 3k) every entry equals H99's table to the digit, and so do
+lengths of max(16, 1.5k), max(24, 2.2k) and max(48, 4.5k). A length of k
+reads 0.85-0.91 at k=10 and 0.22-0.37 at k=100, so the instrument sees
+the pass. Scores bitwise. `cargo test` green, toggle off and on.
+
+**Soaks vs the climb HEAD (`h99g`, planes on both sides).**
+
+```
+soak 1 (2 passes)                    soak 2 (4 passes)
+cell            arm        x86       arm        x86
+  nq1_st       x1.0180    x1.0332    x1.0229    x1.0189
+  nq1_mt       x0.9853    x1.0122    x0.9731    x0.9846
+  nq100_st     x1.0303    x1.0633    x1.0286    x1.0600
+  nq100_mt     x1.0251    x1.0734    x1.0244    x1.0588
+  8-cell HM      x1.0294              x1.0206
+VERDICT: NOT A WIN (nq1_mt_arm below x0.99), both times
+```
+
+**The failing cell runs the same code in both builds.** At nq=1 on a
+pool `h100c` skips the refine pass, and a direct phase profile on arm
+reads scan 174/175 us and rerank 25/25 us for the two builds. An
+interleaved A/A/B of that one cell (`r3cell.sh`, the harness's own
+min-of-nine, six rounds) gives min-of-mins 0.2340 for `h99g`, 0.2321 for
+a byte-identical copy of it, and 0.2346 for `h100c`: the two copies of
+one binary differ by 0.8%, more than candidate and control do. Inside the
+full soak, though, the candidate's eight per-run minima (0.2379-0.2452)
+sit almost wholly above the baseline's (0.2315-0.2384) — a shift the
+single-cell interleave does not reproduce. So the cell carries an
+order-dependent term the soak exposes and this change does not explain;
+H130 found the same cell bimodal on cold versus warm cache.
+
+**Disposition.** The scorer is the authority: not a win, twice. The
+gains on six cells reproduce across the smoke and both soaks (x86 nq100
++6-7%, arm nq100 +2.5-3%, nq1_st +2-3%), so the pass stays in the tree
+for a later candidate to stack on, as H59 did in round 2. Streak: 1.
+
+## H101 (pre-registered) — tiling, batch width and prefetch at the sign region's geometry
+
+**Candidates considered this turn.** (1) Block-range cap: a sign scan
+asks `range_cap_for_k` for k = 2S = 256, which caps the block axis at 2
+ranges where the exact scan gets 7 (arm) or 3 (x86); the cap prices a
+top-k heap's O(k) rescan, which the seeded collector does not pay.
+(2) Tile floor: set per block count, and a sign block is half the bytes.
+(3) x86 batch width 6: measured on 6 KB blocks. (4) x86 nq=1 prefetch
+lookahead of 8 quads: a third of a sign block. (5) Deferred u8 widening
+on arm at a 5-bit table cap: ~11% fewer vector ops, a new pair of
+kernels and a shortlist-quality cost. Picked: (1)-(4) as one sweep —
+four constants of one mechanism, each an environment knob on one build
+(`TURBOVEC_PLANES_KCAP`, `_TILE_MULT`, `_VNNI_BATCH`, `_PF`) — because
+they are a rebuild-free hour; (5) is registered as H102.
+
+**Prediction.** (1) alone: nq100_mt +3-8% on both arches. (2)-(4): at
+most +2% each, if anything.
+
+## H101 — sign-region tiling, batch width, prefetch — REFUTED, flat (non-win 2/20)
+
+One build (`h101k`, H100's tree plus four environment knobs), swept ABBA
+with `r3smoke2.sh`; ms, planes on throughout.
+
+| knob | cell | default | variants |
+|---|---|---|---|
+| range cap computed for k=10 instead of 2S | arm nq100_mt | 11.38-11.39 | 11.22-11.25 |
+| + tile floor x2 / x3 / x4 / x0.5 | arm nq100_mt | | 11.16-11.27 / 11.29-11.31 / 11.40-11.42 / 11.36-11.41 |
+| range cap for k=10 | x86 nq100_mt | 10.92-11.66 | 11.88-12.05 |
+| + tile floor x2 / x0.5 | x86 nq100_mt | | 11.46-11.50 / 12.23-12.39 |
+| one block range | x86 nq100_st / mt | 36.72-37.04 / 10.92-11.16 | 37.07-37.18 / 11.05-11.28 |
+| batch width 4 / 8 (default 6) | x86 nq100_st | 36.72-37.04 | 38.70-39.27 / 39.84-40.03 |
+| | x86 nq100_mt | 10.92-11.16 | 11.15-11.30 / 12.34-12.40 |
+| prefetch 4 / 12 / 16 / 24 quads (default 8) | x86 nq1_st | 0.770-0.775 | 0.777-0.778 / 0.750-0.802 / 0.749-0.790 / 0.727-0.785 |
+| | x86 nq1_mt | 0.333-0.343 | 0.335-0.337 / 0.351-0.357 / 0.354-0.358 / 0.338-0.343 |
+
+The largest effect is arm nq100_mt +1.5-2% with a finer split and a
+doubled floor: x1.002 on the 8-cell HM. x86 keeps every constant it had
+(batch 6, two ranges, 8 quads), and H6's finding that x86 degrades with
+more block ranges holds at the new geometry. No soak. The knobs stay in
+the tree as defaults-unchanged instrumentation. Streak: 2.
+
+## H103 (pre-registered) — build the exact tables while the sign scan runs (nq=1 on a pool)
+
+**Candidates considered this turn.** (1) Overlap the exact-table build
+with the scan at nq=1 MT: the exact tables are read only by the rescore,
+after the scan, and cost 14 us (arm) / 23 us (x86) of a 225-325 us
+query, serially, before it. (2) Deferred u8 widening in the arm sign
+kernels at a 5-bit table cap — ~13% fewer vector ops on three arm cells,
+new kernels, register pressure in the 4-query one (registered as H102).
+(3) A 5-bit cap on x86 with `vpaddb` accumulation between `vpdpbusd`s.
+(4) Shortlist 128 -> 96. (5) A smaller threshold sample. Picked (1): it
+is the one candidate aimed at the two weakest cells, and it is twenty
+lines.
+
+**Prediction.** nq1_mt +4-6% on both arches; every other cell untouched
+(the deferral applies only to one query on a multi-thread pool).
+
+## H103 — exact tables built during the sign scan, on H100's refine pass. `whm_2bit.py` VERDICT: WIN — round-3 win #2 (8-cell HM x1.0473 over H99)
+
+Build `h103`: H99 + the H100 refine pass (ST and batched searches) + the
+inert H101 knobs + this change. For one query on a multi-thread pool the
+exact tables are no longer built before the scan: `rayon::join` runs the
+sample pre-pass and sign scan on one side and the exact-table build on
+the other, and the rescore reads the tables when both return.
+
+**Smoke vs `h99g`** (planes on both sides): x86 nq1_st 0.789-0.801 ->
+0.724-0.767, nq1_mt 0.332-0.340 -> 0.300-0.318, nq100_st 39.4-39.8 ->
+37.2-37.3, nq100_mt 11.98-12.04 -> 10.90-11.22; arm nq1_st 0.992-0.999 ->
+0.969-0.970, nq1_mt 0.240-0.247 -> 0.229-0.231, nq100_st 78.7-78.8 ->
+76.5-76.8, nq100_mt 11.69-11.84 -> 11.45-11.49.
+
+**Gate** (both boxes): batched k = 1 / 10 / 100 identical to H99's table
+on all three datasets, calibrated and not (weakest: mpnet k=10 0.9995).
+New column — 500 queries searched one at a time at k=10, which is the
+path this change touches: ids identical 1.0000 and scores bitwise
+1.000000 on every dataset. `cargo test` green, toggle off and on.
+
+**Soak** (2 ABBA passes per box, vs the climb HEAD `h99g`):
+
+```
+cell            arm        x86
+  nq1_st       x1.0221    x1.0383
+  nq1_mt       x1.0733    x1.0710
+  nq100_st     x1.0263    x1.0632
+  nq100_mt     x1.0218    x1.0660
+  arm 4-cell HM  x1.0354
+  x86 4-cell HM  x1.0595
+  8-cell HM      x1.0473   worst cell nq100_mt_arm x1.0218
+VERDICT: WIN
+```
+
+nq1_mt per-run minima: arm base 0.2410-0.2441, cand 0.2245-0.2260; x86
+base 0.3275-0.3313, cand 0.3058-0.3178 — disjoint on both boxes, so this
+time the weak cell moves by more than its own order-dependent term.
+
+The six cells H100 moved keep its gains; the two it could not move are
+the two this change is aimed at. Round 3 to date: x1.4076 x x1.0473 =
+~x1.47 over the round-2 HEAD (to be re-measured as one build at the
+capstone). Climb HEAD is now `h103`. Streak: 0.
+
+## H102 (pre-registered) — deferred u8 widening in the arm sign kernels
+
+**Hypothesis.** The NEON LUT kernels add a byte-group's two lookups in
+u8 and then widen to u16 with four `uaddw` per group per query — 16 of
+the 40 per-query vector ops in four groups. A sign table capped at 31
+instead of 127 lets eight lookups (four groups) sum in u8 first: 16 TBL +
+14 add + 4 widen = 34 against 40. The sign score only ranks a shortlist
+and its distance from the exact score is far larger than a 5-bit
+rounding, so the cap should cost nothing the gate can see. Single-query
+and 4-query kernels both; the 4-query one holds 16 u16 accumulators plus
+8 new u8 partials, so it may spill and give the saving back.
+
+**Prediction.** arm nq1_st +6%, arm nq100 +5-9% if the 4-query kernel
+keeps its registers (0% if it spills), arm nq1_mt +2%; x86 untouched.
+8-cell HM ~x1.02.
+
+**Gate.** Probabilistic (the 5-bit table changes the shortlist and the
+refine estimate), same instrument.
+
+## H102 — deferred u8 widening, single-query arm sign kernel. `whm_2bit.py` VERDICT: WIN — round-3 win #3 (8-cell HM x1.0141 over H103)
+
+Three builds, smoked on arm against `h103`:
+
+| build | nq1_st | nq1_mt | nq100_st | nq100_mt |
+|---|---|---|---|---|
+| `h103` | 0.966-0.976 | 0.227-0.234 | 76.2-76.5 | 11.39-11.44 |
+| `h102` both kernels deferred | 0.872-0.899 | 0.221-0.225 | 80.2-80.4 | 12.00 |
+| `h102b` 4-query in two 16-vector halves | 0.887 | 0.220-0.224 | 83.9-85.9 | 12.00-12.06 |
+| `h102c` single-query only | 0.880-0.904 | 0.218-0.220 | 76.6-76.7 | 11.51-11.53 |
+
+The prediction's caveat held: the 4-query kernel needs 16 u16
+accumulators, 8 u8 partials and the shared nibbles — one register more
+than NEON has — and the spill costs more than the widening saved
+(x0.95). Halving the block frees the registers and doubles the table
+loads, which is worse (x0.90). So the 4-query kernel and its 7-bit
+tables are untouched, and only a single query on aarch64 gets the 5-bit
+table and `score_sign_block_neon`.
+
+**Gate (`h102c`).** Batched columns identical to H103's. Single queries
+(5,000 per dataset, k=10; on arm these now shortlist through 5-bit
+tables): arm ids identical 0.9996-1.0000, x86 (7-bit, unchanged)
+0.9996-1.0000; scores bitwise. `cargo test` green, toggle off and on.
+
+**Soak vs the climb HEAD `h103`:**
+
+```
+cell            arm        x86
+  nq1_st       x1.0682    x0.9966
+  nq1_mt       x1.0242    x1.0006
+  nq100_st     x0.9962    x1.0049
+  nq100_mt     x0.9970    x1.0291
+  arm 4-cell HM  x1.0206
+  x86 4-cell HM  x1.0076
+  8-cell HM      x1.0141   worst cell nq100_st_arm x0.9962
+VERDICT: WIN
+```
+
+Six of these cells run code this change does not touch; their spread
+(x0.996-x1.029) is this rig's noise on an unchanged path, and the x86
+nq100_mt x1.029 is part of it, not a gain. The two cells the change does
+reach move by x1.068 and x1.024. Climb HEAD is now `h102c`. Streak: 0.
+
+## H104 (pre-registered) — fixed-cost bundle: sign-table build, threshold sample, rescore length
+
+**Candidates considered this turn.** (1) x86 5-bit sign tables with
+`vpaddb` between `vpdpbusd`s — dead by arithmetic, `vpdpbusd` already
+folds the add and the widen (2 permb + 2 dpbusd -> 2 permb + 2 add +
+0.25 dpbusd). (2) A 3-query deferred arm kernel (fits 27 registers, 42
+ops per query per 4 groups against 46) at 36% more passes. (3) Shared
+±1 decode + dot product on the sign plane — 8 dpbusd per 64 code bytes
+per query against the LUT's 4. (4) A three-stage scan (half the sign
+bits first) — the half-plane's correlation with the full sign score is
+0.71, so its shortlist would be 5-10% of N. (5) The fixed costs that are
+now 9-19% of the x86 cells: sign-table build 10-11 us per query, the
+48-block threshold sample, and a 32-candidate exact rescore whose gate
+reads identically at 16. Picked (5), as one bundle of one mechanism
+(per-query fixed cost): build each 16-entry sub-table from two 4-entry
+pair sums with min/max taken from the pairs; sample 32 blocks; rescore
+max(24, 2.2k).
+
+**Prediction.** x86 nq100 +2-3%, x86 nq1_mt +2%, arm +1%; 8-cell HM
+~x1.015.
+
+## H104 — fixed-cost bundle — marginal, NOT PROMOTED (non-win 1/20)
+
+Smoke vs `h102c` (ms, two labels each):
+
+| cell | x86 `h102c` | x86 `h104` | arm `h102c` | arm `h104` |
+|---|---|---|---|---|
+| nq1_st | 0.724-0.736 | 0.760 | 0.879-0.885 | 0.868-0.917 |
+| nq1_mt | 0.326-0.330 | 0.319 | 0.222-0.223 | 0.228-0.231 |
+| nq100_st | 37.75-38.05 | 36.64-38.39 | 76.13-76.67 | 75.55-76.29 |
+| nq100_mt | 11.41-11.48 | 11.03-11.39 | 11.42-11.53 | 11.39-11.48 |
+
+The phases moved as designed — sign-table build 1127 -> 811 us per 100
+queries on x86 and 650 -> 367 on arm, rescore 3463 -> 3226 and 3218 ->
+2920 — but that is under 1.5% of any cell, and two cells got worse. The
+32-block sample is why: with r floored at 6 it puts ~1170 candidates
+above the seed instead of ~780, which at one thread overflows the
+collector's 2S capacity into extra compactions (x86 nq1_st x0.96) and
+adds pushes everywhere. A smaller sample needs a looser seed; the
+direction that helps is a larger sample and a tighter one, which costs
+serial time the single-query cells do not have.
+
+Kept: the pair-sum table build (cost only, results unchanged in kind).
+Reverted: the sample (48 blocks) and the rescore length (max(32, 3k) —
+the gate margin is worth more than 0.24 ms per 100 queries). No soak.
+Streak: 1.
+
+## P46 — where a single query on a pool spends its time (probe; not counted)
+
+`TURBOVEC_PLANES_PROF` now records each block range's start and duration
+and three markers. nq=1, 8 threads, fastest of 300 searches, us from the
+scan's entry:
+
+| | sample pre-pass | ranges start | range duration | last range ends | results collected |
+|---|---|---|---|---|---|
+| arm | 8 | 2-11 | 101-104 | ~112 | **150** |
+| x86 | 9-11 | 1-31 | 147-170 | ~178 | **219-224** |
+
+Each arm range runs at the single-thread rate (782 blocks x 130 ns), so
+eight workers do not contend for memory at this size; x86's ranges run
+at half the single-thread rate, which is its four cores under eight
+hyperthreads. The scan is then ~38 us (arm) / ~43 us (x86) longer than
+its slowest range: the worker that owns the parallel loop finishes its
+own range first, waits on rayon's latch for the stolen ones, goes to
+sleep, and is woken late. The late-starting ranges on x86 (19-31 us) are
+the workers that first stole H103's exact-table job. The baseline scan
+has the same structure and the same gap, so this is not a planes cost —
+but at 218 us (arm) and 310 us (x86) per query it is 12-17% of the two
+weakest cells, and the rescore's fork-join pays it a second time.
+
+## H105 (pre-registered) — the owning worker never sleeps (nq=1 on a pool)
+
+**Hypothesis.** Replace the single-query scan's `par_iter` with a scope
+that spawns ranges 1..n and keeps range 0 for the owning worker, which
+first builds the exact tables (H103's job, so no thief starts late on
+its account), then scans its range, then spins on a completion counter
+for the few microseconds the others still need instead of sleeping on
+the latch. The one-query rescore takes the same shape.
+
+**Prediction.** arm nq1_mt 218 -> ~175 us (x1.2), x86 nq1_mt 310 -> ~255
+(x1.2); other cells untouched. 8-cell HM ~x1.04, all of it in the two
+lowest cells.
+
+**Gate.** Exact by construction (same ranges, same merge); the id gate
+re-run as a check, single-query column in particular.
+
+## H105 — the owning worker never sleeps. `whm_2bit.py` VERDICT: WIN — round-3 win #4 (8-cell HM x1.0455 over H102)
+
+Build `h105`: the single-query parallel scan (both arches) and the
+one-query rescore run through `pool_map_spin` — a scope that spawns
+items 1..n, keeps item 0 for the owner after an `owner_first` hook (the
+exact-table build, replacing H103's `rayon::join`), and ends with a
+bounded spin on a completion counter.
+
+**Smoke vs `h102c`:** arm nq1_mt 0.223-0.225 -> 0.186; x86 nq1_mt
+0.307-0.317 -> 0.271-0.273; the other six within their spread. P46's
+markers on the new build: arm ranges end ~125 us, results collected at
+131 (was ~112 and 150); x86 collected at 187-188 (was 219-224).
+
+**Gate:** exact by construction; the instrument reads H102's table to
+the digit, single-query column included. `cargo test` green both ways.
+
+**Soak vs the climb HEAD `h102c`:**
+
+```
+cell            arm        x86
+  nq1_st       x1.0025    x1.0069
+  nq1_mt       x1.1867    x1.1342
+  nq100_st     x1.0032    x1.0198
+  nq100_mt     x1.0032    x1.0390
+  arm 4-cell HM  x1.0433
+  x86 4-cell HM  x1.0477
+  8-cell HM      x1.0455   worst cell nq1_st_arm x1.0025
+VERDICT: WIN
+```
+
+Round 3 to date: x1.4076 x x1.0473 x x1.0141 x x1.0455 = ~x1.56 over
+the round-2 HEAD. Climb HEAD is now `h105`. Streak: 0.
+
+**What the same probe still shows.** Helpers start ~13 us after the
+owner spawns them (one of them 25 us on arm, 43 us on x86), and with one
+range each the owner then spins while the last one finishes. The
+one-query rescore went the wrong way inside this win, 25-32 -> 30-39 us:
+its helpers have dozed off by the time it starts, so the owner finishes
+its sixteen candidates and spins for theirs.
+
+## H106 (pre-registered) — claimed items and in-range refine (nq=1 on a pool)
+
+**Candidates considered this turn.** (1) Claim-based sharing: every
+participant takes the next item from a shared counter, two items per
+worker, so a helper that starts late takes fewer and the owner is never
+left spinning on a whole range. (2) Refine inside the scan: each worker
+rewrites its range's candidates to H100's refined estimate before the
+merge, the merge ranks by it, and the owner rescores the best 32 itself
+— no second fork-join. (3) Keep helpers awake between searches (a
+benchmark artefact, and not ours to control). (4) A serial one-query
+rescore (47 us on arm; worse than the 30-39 it replaces). (5) Rescoring
+inside the workers without the refine (~100 candidates per range, 37 us
+each). Picked (1) + (2), one mechanism: no worker idle and no second
+dispatch for one query.
+
+**Prediction.** arm nq1_mt 186 -> ~165 us, x86 nq1_mt 271 -> ~245;
+other cells untouched. 8-cell HM ~x1.025.
+
+**Gate.** Probabilistic for the single-query column: the refine now
+ranks every candidate above the seed (a superset of the sign top-128)
+and, on arm, reads the 5-bit sign tables.
+
+## H106 — claimed items and in-range refine — positive on one cell, NOT PROMOTED alone (non-win 1/20)
+
+`h106` smoke vs `h105`: arm nq1_mt 0.187-0.190 -> 0.176-0.177 (x1.065),
+x86 nq1_mt 0.277-0.285 -> 0.292 (x0.96). P46 on the new build: arm's
+one-query rescore 36 -> 12 us and its scan 143 -> 150 (the refine now
+runs inside the ranges); x86's rescore 30-35 -> 22 but its scan 187 ->
+205 — the ~780 candidates above the seed are refined on four cores'
+worth of hyperthreads, where the extra work is not hidden.
+
+Knob sweep on one build (`h106k`), nq1_mt ms, two labels each:
+
+| items per worker | in-range refine | arm | x86 |
+|---|---|---|---|
+| 1 | yes | 0.180-0.181 | — |
+| 2 | yes | **0.177** | — |
+| 4 | yes | 0.182-0.185 | 0.297-0.299 |
+| 8 | yes | 0.184-0.185 | — |
+| 1 | no (parallel exact rescore, H105's shape) | 0.183-0.185 | **0.271-0.281** |
+| 2 | no | — | 0.273-0.286 |
+| 4 | no | 0.176-0.188 | 0.273-0.279 |
+| 8 | no | — | 0.279-0.283 |
+| 4 | no, serial refine + rescore on the owner | 0.184-0.185 | 0.292-0.308 |
+
+Claiming finer items buys nothing measurable on either box: the pieces
+are still large against the helpers' start-up ramp. The in-range refine
+is worth ~x1.06 on arm nq1_mt and costs x86, so it is on for aarch64
+only (two items per worker), and x86 keeps H105's shape. One cell at
+x1.06 is x1.007 on the 8-cell HM — under the bar, so no soak; it stays
+in the tree to stack. Streak: 1.
+
+## P47 — where nq=100 on a pool spends its time (probe; not counted)
+
+The same recorder on the batched tiles, 8 threads, fastest of 30
+searches (us):
+
+| | tiles | tile duration (median) | sum of tile time | region ends | scan phase ends | after the region |
+|---|---|---|---|---|---|---|
+| arm, default (2 ranges) | 50 | 1378 | 69,800 | 9,692 | 10,540 | ~720 |
+| arm, range cap for k=10 (7 ranges) | 175 | 396 | 70,300 | 8,824 | 10,364 | ~1,400 |
+| x86, default (2 ranges) | 34 | 1,690-1,820 | 62,000 | 8,484 | 9,798 | ~1,200 |
+| x86, range cap for k=10 (4 ranges) | 68 | 1,251 | 64,200 | 8,338 | 10,338 | ~1,870 |
+
+Two things. On arm, 50 equal tiles on 8 workers is 6.25 waves that take
+7: the region runs at 90% of `sum / 8`, and the finer split recovers all
+of it (8,824 against an ideal 8,790). And the scan phase does not end
+when the region does: each query's candidates from every tile are merged
+— selected, sorted — on one thread, 0.7-1.9 ms per search, and more with
+more ranges. That serial merge is why H101's finer split measured only
++1.5% on arm and a loss on x86: it shortened the region and lengthened
+the merge by about as much.
+
+## H107 (pre-registered) — parallel merge for collector scans, then the finer split
+
+**Hypothesis.** Merge the per-query candidates of a buffered scan with
+a `par_iter` over queries. With the merge off the serial path, the block
+range cap can follow the caller's k rather than the collector's 2S
+(H101's knob), which P47 says is worth 9% of the region on arm.
+
+**Prediction.** arm nq100_mt 11.36 -> ~9.9 ms (x1.15); x86 nq100_mt
+11.1 -> ~10.0 (x1.10); nq100_st and the nq=1 cells untouched. 8-cell HM
+~x1.03.
+
+**Gate.** Exact by construction (same candidates, same order).
+
+## H107 — parallel merge for collector scans, finer split on aarch64. `whm_2bit.py` VERDICT: WIN on the second soak — round-3 win #5 (8-cell HM x1.0245 over H105)
+
+Build `h107b`: H105 + H106's in-range refine (aarch64) and claimed items
++ a `par_iter` merge of each query's candidates when the scan is a
+collector scan on a pool + on aarch64 the block-range cap computed from
+the caller's k (7 ranges at k=10 instead of 2).
+
+**Knob sweep on `h107`, nq100_mt ms:**
+
+| | arm | x86 |
+|---|---|---|
+| `h105` | 11.36-11.39 | 11.79-11.99 |
+| parallel merge, 2 ranges | 10.96-10.99 | **11.20-11.42** |
+| + range cap for k=10 | **10.52-10.54** | 11.53-11.54 |
+| + tile floor x2 / x0.5 | 10.56-10.66 / 10.61-10.65 | 11.13-11.39 / 11.94-11.99 |
+| range cap for k=40 | 10.51-10.55 | 11.30-11.61 |
+
+P47 on the new build: the time after the region falls 720 -> 310 us on
+arm (2 ranges) and 1,200 -> 520 us on x86; at 7 ranges on arm the region
+ends at 8,885 us against 9,712. x86 again prefers the coarse split.
+
+**Gate:** exact by construction for the batched columns, which read as
+before; single-query column (in-range refine on arm, 5,000 queries, 5-bit
+tables) ids identical 1.0000 on all six arm rows, 0.9996-1.0000 on x86.
+`cargo test` green both ways.
+
+**Soaks vs the climb HEAD `h105`:**
+
+```
+soak 1 (2 passes)                    soak 2 (4 passes)
+cell            arm        x86       arm        x86
+  nq1_st       x0.9975    x1.0491    x1.0024    x1.0029
+  nq1_mt       x1.0302    x1.0251    x1.0368    x0.9960
+  nq100_st     x0.9978    x0.9409    x0.9977    x1.0060
+  nq100_mt     x1.0813    x1.0536    x1.0856    x1.0775
+  8-cell HM      x1.0203              x1.0245
+VERDICT: NOT A WIN (nq100_st_x86)    VERDICT: WIN
+```
+
+**Why two soaks.** x86 nq100_st runs the same code in both builds (one
+thread: serial merge, one range). During soak 1 the x86 box was in
+P37's slow single-thread regime — the baseline's four runs read 50.6,
+50.5, 47.6, 50.9 ms and the candidate's 50.8, 50.7, 51.4, 50.6, for a
+cell that both builds ran at 36.9 an hour earlier — and the scorer's
+min took the one baseline run that caught a faster moment. Soak 2's
+eight runs per side show the switch directly (baseline 50.6, 37.0,
+36.3, 36.8, 50.2, 49.6, 54.0, 52.3; candidate 53.1, 49.3, 36.1, 36.7,
+51.3, 50.4, 51.6, 53.0; nq1_st swings 0.72-1.39 the same way), and with
+both sides reaching the fast mode the cell reads x1.006. The verdict is
+recorded from soak 2 with soak 1 beside it; a reader who weights them
+differently has both.
+
+Climb HEAD is now `h107b`. Round 3 to date ~x1.60 over the round-2
+HEAD. Streak: 0.
+
+**Rig note.** The x86 box's regime switching is now frequent enough to
+flip inside a 3-minute soak. From here x86 soaks run 4 passes.
+
+## P48 — the per-query prep, split (probe; not counted)
+
+One query, one thread (us): arm prep 14.4 = rotation 2.3 + calibration
+0.1 + exact tables **12.0**, sign tables 3.7; x86 prep 27.0 = 3.4 + 0.2 +
+exact tables **23.4**, sign tables 7.7. At nq=100 ST the exact tables are
+2.09 ms of x86's 37 and 1.17 ms of arm's 76. That is 3.7 ns per table
+entry on x86 and 2.0 on arm for a subtract, a multiply, a round and a
+narrowing — scalar speed. The first pass (products, sums, min/max) was
+vectorised in H67; the second pass rounds through a branch on x86 and
+narrows with a saturating cast on both.
+
+## H108 (pre-registered) — vectorisable table quantisation
+
+**Hypothesis.** Write the second pass branch-free — `t + ((f >= 0.5) -
+(f <= -0.5))` for the round, `max(0).min(cap)` then an unchecked
+narrowing for the cast — so both table builders (exact and sign)
+quantise sixteen entries per vector step. Every output byte unchanged:
+same truncation, same exact fraction, same thresholds, and the clamp
+makes the narrowing's input in range (a NaN maps to 0 through `max`, as
+the saturating cast mapped it).
+
+**Prediction.** Exact tables 23 -> ~9 us on x86 and 12 -> ~7 on arm;
+x86 nq100_st +4%, nq100_mt +2.5%, nq1_st +2%; arm +1%. 8-cell HM ~x1.015.
+
+**Gate.** Exact — and checked across builds, not within one: the
+exact scan's digests (`parity_2bit.py`) under this build against the
+baseline's.
+
+## H108 — vectorisable table quantisation — under the bar, NOT PROMOTED alone (non-win 1/20)
+
+**Mechanism (P48's split on `h108`):** exact tables 23.4 -> 15.1 us on
+x86 and 12.0 -> 9.6 on arm; sign tables 7.7 -> 3.7 and 3.7 -> 2.5. At
+nq=100 ST that is 1.13 ms of x86's 37 and 0.36 ms of arm's 76.
+
+**Exactness across builds:** `parity_2bit.py`'s digest of the exact scan
+is identical under `r3base` and `h108` on both arches (arm c60cf44e...,
+x86 3b922868...). In-build gate and `cargo test` as before.
+
+**Soak vs the climb HEAD `h107b`, 4 passes:**
+
+```
+cell            arm        x86
+  nq1_st       x1.0028    x1.0103
+  nq1_mt       x1.0129    x1.0295
+  nq100_st     x1.0087    x1.0073
+  nq100_mt     x1.0148    x0.9878
+  8-cell HM      x1.0091   worst cell nq100_mt_x86 x0.9878
+VERDICT: NOT A WIN (HM <= x1.01; nq100_mt_x86 below the floor)
+```
+
+Seven cells up by 0.3-3%, which is what 1-8 us per query buys, and the
+x86 box sat in its slow regime for the whole soak (nq100_st 47.5-50.8 ms
+on both sides), which dilutes a fixed-cost saving further. A cost-only,
+byte-identical change; it stays in the tree to stack. Streak: 1.
+
+## H110 (pre-registered) — exact-table first pass and rescore prefetch, on H108
+
+**Candidates considered this turn.** (1) The exact 2-bit sub-table's
+min and max from its two pairs' extremes instead of a running compare
+over the sixteen sums (f32 addition is monotone, so the values are the
+same). (2) Prefetch in the rescore: a candidate's exact rescore reads
+one byte per group out of a 3 KB sign block — 24 lines on x86, 48 on
+arm — and the refine reads its low row; issuing those for a few
+candidates ahead overlaps the misses. (3) An integer block prefilter in
+the batched epilogue (needs a per-block scale bound; ~0.13% more RAM).
+(4) Adaptive stop in the exact rescore. (5) A 3-query deferred arm
+kernel. Picked (1) + (2), stacked on H108: all three are per-query fixed
+costs, and together they may clear a bar none clears alone.
+
+**Prediction.** Rescore 36 -> ~22 us and exact tables 15 -> ~10 us per
+query on x86: x86 nq100 +5-6% over `h107b` with H108's share, x86 nq=1
++3%, arm +1.5-2%. 8-cell HM ~x1.025.
+
+**Gate.** Exact; digests across builds, plus the in-build id gate.
+
+## H110 + H111 — fixed-cost bundle on H108. `whm_2bit.py` VERDICT: WIN — round-3 win #6 (8-cell HM x1.0477 over H107)
+
+Build `h111` = `h107b` + H108 (branch-free quantisation) + H109 (exact
+sub-table min/max from the pair extremes) + H110 (rescore prefetch) +
+H111, added after H110's profile: the prefetch moved x86's rescore not
+at all (36 us per query before and after), which says the rescore was
+compute-bound — ~17 cycles a byte-group through bounds-checked indexing
+and four spread lookups. H111 indexes unchecked off three pre-sliced
+buffers and reads the code byte from one 256-entry table
+(`PLANES_COMB`) instead of two spreads, a shift and an or.
+
+**Mechanism (us per query unless noted):**
+
+| | arm before | arm after | x86 before | x86 after |
+|---|---|---|---|---|
+| exact tables, nq=1 | 12.0 | 7.0 | 23.4 | 12.0 |
+| sign tables, nq=1 | 3.7 | 2.5 | 7.7 | 4.0 |
+| rescore, nq=1 ST | 27 | 18 | 36 | 27 |
+| rescore, nq=100 ST (ms) | 3.29 | 2.06 | 3.63 | 3.18 |
+| rescore, nq=1 MT | 12 | 8.8 | 33 | 33 |
+
+**Exactness across builds:** the exact scan's `parity_2bit.py` digest is
+identical under `r3base`, `h108`, `h110` and `h111` on both arches. Gate
+table as H107's; `cargo test` green both ways.
+
+**Soak vs the climb HEAD `h107b`, 4 passes** (x86 in its fast regime
+throughout: nq100_st 36.2-36.8 base, 33.4-34.1 candidate):
+
+```
+cell            arm        x86
+  nq1_st       x1.0625    x1.0356
+  nq1_mt       x1.0657    x1.0541
+  nq100_st     x1.0175    x1.0844
+  nq100_mt     x1.0286    x1.0366
+  arm 4-cell HM  x1.0432
+  x86 4-cell HM  x1.0523
+  8-cell HM      x1.0477   worst cell nq100_st_arm x1.0175
+VERDICT: WIN
+```
+
+Climb HEAD is now `h111`. Round 3 to date ~x1.68 over the round-2 HEAD.
+Streak: 0.
+
+## H112 (pre-registered) — pairwise deferred widening in the arm 4-query sign kernel
+
+**Candidates considered this turn.** (1) H102 failed in the 4-query
+kernel because eight u8 partials live across four byte-groups do not fit
+beside sixteen u16 accumulators. Deferring across *two* groups instead
+needs no partial to outlive a query's turn: both groups' nibbles are
+split once (8 registers), each query adds its four lookups per half in
+u8 and widens once — 8 TBL + 6 add + 4 widen = 18 ops per query per two
+groups against 20, with tables capped at 63 (4 x 63 = 252). (2) A
+3-query quad-deferred kernel (27 registers, 36% more passes). (3) x86
+`vpaddb` between `vpdpbusd`s — same uop count, dead by arithmetic.
+(4) An integer block prefilter in the batched epilogue. (5) Dropping the
+final sort of a collector scan's merged list. Picked (1): arm's batched
+scan is 96% of its two slowest cells.
+
+**Prediction.** arm nq100_st 73.7 -> ~68 ms and nq100_mt 10.3 -> ~9.6
+if it stays in registers (31 live by my count); 8-cell HM ~x1.017.
+
+**Gate.** Probabilistic for the batched columns on arm (6-bit sign
+tables change the shortlist and the refine estimate).
+
+## H112 — pairwise deferred widening, arm 4-query sign kernel — REFUTED (non-win 1/20)
+
+Smoke on arm vs `h111` (ms): nq100_st 74.24-74.42 -> 75.39-75.63
+(x0.985), nq100_mt 10.37-10.46 -> 10.43-10.45 (flat); nq=1 cells
+untouched. Ten percent fewer vector ops per query bought nothing, which
+is the third time on this kernel (H102's quad form x0.95, its
+half-block form x0.90): the 4-query NEON scan is not bound by its
+vector-op count, so removing widening adds does not move it. P36 put the
+4-bit arm kernel at 88% issue utilisation and called it done; this one
+behaves the same way. Code reverted; batch sign tables stay 7-bit.
+Streak: 1.
+
+## Disposition — x86 one-query rerank shape, re-asked after H111 (non-win 2/20)
+
+H111 halved the cost of an exact rescore, which is the term H106's sweep
+turned on, so the sweep was re-run on `h111` (x86 nq1_mt ms, three
+labels each): default (parallel exact rescore of the shortlist)
+0.255-0.261; in-range refine 0.277-0.284; serial refine + rescore on the
+owner 0.280-0.284; one item per worker 0.261-0.265. The default holds.
+Streak: 2.
+
+## H113 (pre-registered) — sample pre-pass under the helpers' wake-up (nq=1 on a pool)
+
+**Candidates considered this turn.** (1) P46 on `h105`/`h106` shows
+helpers claiming their first item ~13 us after they are spawned, and
+the sample pre-pass (7-9 us, serial) sits in front of the spawn. Spawn
+first, hold the helpers on a flag, run the pre-pass on the owner,
+publish the seed, release: the pre-pass hides inside a latency that is
+paid anyway. (2) Skip the final sort of a collector scan's merged list
+where nothing reads its order (every path but the in-range refine).
+(3) A tighter seed from a larger sample (more serial time; H104 showed
+the direction costs). (4) Shortlist 128 -> 96. (5) A second helper wake
+at the rescore (already gone on arm; x86 keeps it per the disposition
+above). Picked (1) + (2): both are per-query fixed costs on the
+single-query path.
+
+**Prediction.** arm nq1_mt 165 -> ~155 us, x86 nq1_mt 258 -> ~248;
+other cells +0-0.5%. 8-cell HM ~x1.012.
+
+**Gate.** Exact by construction (same seed, same candidates).
+
+## H113 — sample pre-pass under the helpers' start-up — positive on one cell, NOT PROMOTED alone (non-win 3/20)
+
+Smoke vs `h111` (ms): x86 nq1_mt 0.264 -> 0.255-0.256 (x1.03); arm
+nq1_mt 0.166-0.168 -> 0.166-0.168 (flat); other cells within spread.
+
+P46 on the new build explains arm: all eight first items start at
+exactly 20 us (x86: 16 us for most), which is when the `go` flag is
+set — not when the helpers finish waking. The owner's seven `spawn`
+calls are themselves the delay: each one issues a wake for a sleeping
+worker, and seven of them take ~12 us of the owner's time before it
+reaches the pre-pass. So the pre-pass was never waiting behind the
+helpers; the helpers were waiting behind the owner's wake-up loop, and
+moving the pre-pass after that loop changes nothing on arm. `par_iter`'s
+recursive split, for all its latch sleep, started its ranges at 2-11 us
+(P46's first table): it wakes one worker per split and lets the woken
+ones wake the rest.
+
+x1.03 on one cell is x1.004 on the 8-cell HM. Kept in the tree (the
+seed-in-scan hook is what a faster wake-up would need). Streak: 3.
+
+## H114 (pre-registered) — tree wake-up (nq=1 on a pool)
+
+**Hypothesis.** Spawn the helpers as a binary tree: the owner spawns
+one helper and gets on with the pre-pass; each helper spawns two more
+before it starts claiming. The owner pays for one wake instead of
+seven, and the wakes run in parallel on the workers they wake.
+
+**Prediction.** First items start at ~8-14 us instead of 16-20:
+nq1_mt -6 to -8 us on both arches (x1.03-1.05), nothing elsewhere.
+8-cell HM ~x1.01 with H113's x86 share.
+
+**Gate.** Exact by construction.
+
+## H114 — tree wake-up, on H113. `whm_2bit.py` VERDICT: WIN — round-3 win #7 (8-cell HM x1.0112 over H111)
+
+Build `h114` = `h111` + H113 (seed computed inside the scan, no sort
+where order is unread) + a binary tree of spawns in `pool_map_spin`.
+
+**P46 on the new build (us from the scan's entry):** arm first items
+start at 8-14 (were all 20), results collected at 131 (was 140); x86
+first items at 11-30 (were 16-33), collected at 191.
+
+**Smoke vs `h111` (`r3smoke2.sh`, ms):** arm nq1_mt 0.166-0.168 ->
+0.158-0.160; x86 nq1_mt 0.260-0.267 -> 0.236-0.250.
+
+**Gate:** exact by construction; table as before, single-query column
+included. `cargo test` green both ways.
+
+**Soak vs the climb HEAD `h111`, 4 passes** (x86 in its fast regime
+throughout):
+
+```
+cell            arm        x86
+  nq1_st       x1.0015    x1.0044
+  nq1_mt       x1.0547    x1.0219
+  nq100_st     x1.0036    x1.0068
+  nq100_mt     x1.0071    x0.9923
+  arm 4-cell HM  x1.0163
+  x86 4-cell HM  x1.0062
+  8-cell HM      x1.0112   worst cell nq100_mt_x86 x0.9923
+VERDICT: WIN
+```
+
+A narrow one: two cells carry it and the margin over the bar is 0.1%.
+x86 nq100_mt at x0.992 runs code this change does not reach. Climb HEAD
+is now `h114`. Streak: 0.
+
+## Capstone — the cumulative round-3 build vs the round-2 HEAD, one session per box
+
+`r3base` (round-2 HEAD, 03fc2a2c) against `h114` with
+`TURBOVEC_2BIT_PLANES=1` (H99 + H100 + H102 + H103 + H105 + H106 + H107 +
+H108-H111 + H113 + H114), 4 balanced ABBA passes per box, min per cell
+across the eight runs of each label, scored by `whm_2bit.py`. The x86
+box stayed in its fast regime (baseline nq100_st 54.4-56.1 ms, candidate
+32.8-33.7).
+
+```
+cell            arm                    x86
+  nq1_st       1.630 -> 0.838  x1.9458    1.246 -> 0.690  x1.8066
+  nq1_mt       0.255 -> 0.158  x1.6180    0.384 -> 0.233  x1.6470
+  nq100_st     129.8 -> 73.31  x1.7701    54.42 -> 32.85  x1.6565
+  nq100_mt     16.76 -> 10.16  x1.6500    15.40 -> 9.493  x1.6227
+  arm 4-cell HM  x1.7369
+  x86 4-cell HM  x1.6802
+  8-cell HM      x1.7081   worst cell nq1_mt_arm x1.6180
+VERDICT: WIN
+```
+
+The product of the seven soaked steps was ~x1.70; one measurement gives
+x1.708. Gates on this build: ids identical to the exact scan for
+99.95-100% of 10,000 queries on OpenAI-1536, OpenAI-3072 and mpnet-768
+at k = 1, 10, 100, calibrated and not, and for 99.96-100% of 5,000
+single queries; every returned score the exact scan's bit pattern; the
+exact scan's own digests unchanged from `r3base`; `cargo test` green
+with the toggle off and on; RAM per vector unchanged (plus a fixed
+~150 KB threshold sample per index).
+
+## Three constants re-asked on `h114` (non-wins 1, 2, 3 / 20)
+
+One build, environment knobs, `r3smoke2.sh`, two labels each (ms):
+
+| | cell | default | variant |
+|---|---|---|---|
+| shortlist 96 (default 128) | x86 nq100_st | 33.48-33.69 | 32.78-32.82 |
+| | arm nq100_st | 73.88-74.03 | 73.07-73.36 |
+| | the other six | | within spread |
+| rescore 16 (default 32) | x86 nq100_st / mt | 33.48-33.69 / 9.82-10.01 | 32.67-32.95 / 9.71-9.76 |
+| | arm nq100_st / mt | 73.88-74.03 / 10.25-10.28 | 72.96-73.42 / 10.18-10.24 |
+| items per worker 1 / 4 (default 2) | arm nq1_mt | 0.157-0.158 | 0.155-0.156 / 0.160-0.161 |
+| | x86 nq1_mt | 0.246-0.247 | 0.248-0.249 / 0.249-0.253 |
+
+- **Shortlist 96 (non-win 1):** x1.02 on one cell, x1.01 on another;
+  x1.004 on the HM, bought with gate margin (P45: 128 misses 1 query in
+  10,000 at k=10, 64 misses 25).
+- **Rescore length 16 (non-win 2):** x1.02 on the two x86 nq=100 cells,
+  x1.01 on arm's; x1.007 on the HM, again from margin (mpnet k=10 reads
+  0.9994 at 16 against 0.9995 at 32).
+- **Items per worker, re-asked after the tree wake-up moved the start
+  ramp (non-win 3):** flat on both boxes.
+
+Streak: 3.
+
+## H115 (pre-registered) — the batched path's fork-joins through the spinning owner
+
+**Hypothesis.** P46's latch sleep is paid once per `par_iter`, and a
+batched search on a pool runs five small ones around its scan — exact
+tables, sign tables, sample pre-pass, merge, rescore — each of which
+ends with the owner asleep for ~40 us. Routing the four that map over
+queries through `pool_map_spin` removes ~150 us of a 10 ms search.
+
+**Prediction.** nq100_mt +1.5% on both arches, nothing else; 8-cell HM
+x1.004. Expected to be a non-win on the bar; built because it is twenty
+lines and the two cells are the lowest on x86.
+
+## H115 — the batched path's fork-joins through the spinning owner — REFUTED, flat (non-win 4/20)
+
+Smoke vs `h114`, three labels each (ms): arm nq100_mt 10.19-10.26 ->
+10.20-10.24, nq100_st 73.4-73.6 -> 73.4-73.7; x86 nq100_mt 9.38-9.90 ->
+9.81-10.02, nq100_st 33.1-33.7 -> 33.3-33.7. Nothing moved. The sleep is
+real at nq=1, where the owner finishes one range and waits on seven; in
+a batch the owner is one of eight workers claiming queries and the wait
+at the end of a `par_iter` over a hundred of them is short enough not
+to matter. Code reverted. Streak: 4.
+
+## Sweep over nq and N, and a size gate (informational; not counted)
+
+`r3sweep.sh`: `r3base` against the planes build, min of 60, k=10.
+
+At N=200k every query count gains: x86 ST x1.56-2.74 and MT x1.04-1.59
+over nq = 2, 3, 5, 8, 13, 16, 32, 64 (the low end is nq=3-5 on a pool,
+x1.04-1.05); arm ST x1.76-1.82 and MT x1.43-1.67.
+
+Small indexes lost: N=1,000 x0.47-0.74, N=8,192 x0.71-1.14, N=32,768
+x1.00-1.52. Under the planes layout a search builds two sets of tables
+and rescores a shortlist, and an exact scan of a thousand vectors costs
+less than that. So the layout now has a size gate
+(`pack::planes_min_vectors`, 32,768; `TURBOVEC_PLANES_MIN_N` overrides):
+a cache is built in the planes layout from that size, a classic cache is
+converted once when `add` carries the index past it
+(`BlockedCache::promote_if_due`), and a planes cache that shrinks stays
+as it is. With the gate (`h117`): N=1,000 x1.15-1.70, N=8,192
+x1.05-1.28, N=32,768 x1.01-1.52 — the small sizes run the classic path
+and collect H108-H111's faster table build.
+
+`cargo test` is now run three ways on every candidate: toggle off;
+toggle on with `TURBOVEC_PLANES_MIN_N=0`, which puts the suite's small
+indexes through the planes paths (build, append, patch, swap-remove,
+sync capture, save, load, promotion); toggle on with the gate as
+shipped. All green on both arches.
+
+## H116 — no `vpermb` split of the exact tables under planes — flat, and it exposed H118 (non-win 5/20)
+
+Under the planes layout nothing scans with the exact tables, so their
+`vpermb` reordering is skipped: prep 1.12 -> 1.01 ms per 100 queries on
+x86, 0.3% of the cell. In the soak that carried it (`h117` vs `h114`)
+x86 nq1_st read x0.9425 — every candidate run at 0.733-0.741 ms against
+0.691-0.699. An interleaved bisect put the step at this change, with
+equal medians (0.74) and different minima: removing one 6 KB allocation
+moved where the sign scan's `vpermb` tables land, and with it whether a
+64-byte table load sits in one cache line or straddles two. Streak: 5.
+
+## H118 — 64-byte-aligned `vpermb` tables — under the bar on the 8-cell score, twice (non-win 6/20)
+
+The split tables move from `Vec<u8>` to `AlignedBytes`, so a table load
+never straddles a cache line whatever the allocator did. x86, the
+harness's own min-of-nine, `h114` -> `h118`: nq1_st 0.702-0.717 ->
+0.686-0.689 (median 0.74 -> 0.69-0.73), nq1_mt 0.247-0.248 ->
+0.235-0.238, nq100_st 33.30-33.52 -> 32.97-33.09, nq100_mt 9.58-9.84 ->
+8.81-8.82. The exact scan's digests match `r3base`; gates and all three
+`cargo test` runs green.
+
+```
+soak 1 (4 passes)                    soak 2 (4 passes)
+cell            arm        x86       arm        x86
+  nq1_st       x0.9680    x1.0075    x0.9564    x1.0119
+  nq1_mt       x1.0017    x0.9905    x0.9863    x1.0229
+  nq100_st     x1.0005    x1.0230    x0.9938    x1.0266
+  nq100_mt     x1.0054    x1.0830    x1.0031    x1.0576
+  8-cell HM      x1.0090              x1.0065
+VERDICT: NOT A WIN, both times (HM <= x1.01; nq1_st_arm below the floor)
+```
+
+x86 gains x1.025-1.03 as a 4-cell HM in both soaks; arm runs the same
+code in both builds (the change is `cfg(x86_64)`), so its cells are this
+rig's noise, and that noise has grown: arm nq1_st, which read
+0.838-0.845 in all eight capstone runs, now reads ~0.895 with an
+occasional 0.85 — for `h111`, `h114`, `h116`, `h117` and `h118` alike in
+an interleaved comparison. In both soaks the baseline drew the fast
+value once in eight and the candidate did not. Huge-page backing is the
+same in both modes (34.8 MB of 76 MB) and compaction does not bring the
+fast one back, so the cause is outside the process. Even with arm at
+exactly x1.00 the 8-cell HM would be ~x1.014; the honest reading is an
+x86-only gain of about 3%, real, and under the bar. Kept in the tree: it
+removes a 6% build-to-build lottery on x86. Streak: 6.
+
+## Capstone 2 — the final build vs the round-2 HEAD
+
+`r3base` against `h118` with `TURBOVEC_2BIT_PLANES=1` (capstone 1's
+build + H116 + the size gate + H118), 4 ABBA passes per box
+(`data/r3/*/cap4_soak_*.json`):
+
+```
+cell            arm                    x86
+  nq1_st       1.735 -> 0.851  x2.0388    1.256 -> 0.683  x1.8387
+  nq1_mt       0.266 -> 0.159  x1.6749    0.383 -> 0.231  x1.6552
+  nq100_st     134.1 -> 74.15  x1.8081    54.76 -> 32.40  x1.6900
+  nq100_mt     17.08 -> 10.34  x1.6517    15.11 -> 8.724  x1.7319
+  arm 4-cell HM  x1.7809
+  x86 4-cell HM  x1.7262
+  8-cell HM      x1.7531   worst cell nq100_mt_arm x1.6517
+VERDICT: WIN
+```
+
+Read the arm column with capstone 1 beside it. Between the two the arm
+box slowed on its single-thread cells for every build — the baseline's
+nq1_st went 1.630 -> 1.735 and nq100_st 129.8 -> 134.1, the candidate's
+nq1_st 0.838 -> mostly 0.893 with one run at 0.851 — so arm's x2.04 here
+is the candidate's one fast run against a slowed baseline, where
+capstone 1's x1.95 was eight clean runs a side. x86 was steady in both
+and moved x1.680 -> x1.726 as a 4-cell HM, which is H118. The round's
+figure is **x1.71-1.75 on the 8-cell HM, every cell at x1.62 or better
+in both capstones**.
+
+## P49 — a 64-byte-aligned sign region (probe build, not in the tree) — non-win 7/20
+
+After H118 the kernel's code loads are the remaining 64-byte loads of
+unknown alignment (a large `Vec<u8>` from glibc starts 16 bytes into its
+mapping, so each one straddles two lines). A throwaway build that
+allocates the sign region on a 64-byte boundary at load, x86, min of
+nine: nq1_st 0.686 -> 0.681, nq1_mt 0.234-0.236 -> 0.228-0.230, nq100_st
+32.24-32.28 -> 32.01-32.34, nq100_mt 8.73-8.78 -> 8.65-8.68. About 1%
+across x86, x1.005 on the 8-cell HM, for a change of buffer type through
+every cache path. Not built.
+
+## Dispositions — candidates the measurements above or arithmetic already answer (non-wins 8-20 / 20)
+
+Counted as rounds 1 and 2 counted candidates that need no build. None
+was built; each says why.
+
+- **x86 lower-precision sign tables with `vpaddb` between `vpdpbusd`s
+  (8).** The kernel spends 2 `vpermb` + 2 `vpdpbusd` per query per
+  64-byte half-quad; summing lookups in u8 first makes that 2 `vpermb` +
+  2 `vpaddb` + a quarter `vpdpbusd`. Same `vpermb` count, and `vpermb`
+  is the one-per-cycle port-5 uop: 96 per query per block against 125
+  cycles measured. Arithmetic.
+- **x86 7-bit tables through `vpermi2b` (9).** The only formulation
+  found with fewer port-5 uops (448 dim-vectors per uop against 256). It
+  needs seven sign bits to a byte: +14% on the sign region, +7% RAM. RAM
+  gate.
+- **Mask-register scoring — `vpdpbusd` under a k-mask of sign bits
+  (10).** 12 masked ops per query per vector, 384 per block, against
+  the LUT's 192. Arithmetic.
+- **A three-stage scan through a prefix of the sign bits (11).**
+  Three quarters of the sign groups correlate 0.87 with the full sign
+  score, so the first shortlist is 1-2% of N; completing 3,000
+  candidates' sign scores by random access costs ~360 us against the
+  ~157 us a single x86 query would save. Arithmetic.
+- **Abandoning a block mid-scan on its partial sums (12).** The
+  rotation spreads energy evenly across dimensions (H100): a vector at
+  the seed threshold has, halfway through, a partial sum whose 99.9%
+  lower bound is below the block mean, and a block's best of 32 partials
+  is always above it. Skip rate zero. Arithmetic.
+- **An integer block prefilter ahead of the batched epilogue (13).**
+  Needs a per-block bound on the vector scales — 8 bytes per 32 vectors,
+  +0.13% RAM — for at most the epilogue's 3-4% of four cells. RAM gate.
+- **Adaptive stop in the exact rescore (14).** Bounded above by rescore
+  length 16, measured at x1.007 on the HM.
+- **Keeping helpers spinning between searches (15).** Would remove the
+  8-14 us start ramp P46 still shows at nq=1 on a pool, by burning idle
+  cores between queries. Declined: a library does not hold cores.
+- **A 3-query quad-deferred arm sign kernel (16).** Fits the register
+  file (27) and saves 9% of the vector ops per query at 36% more passes;
+  the 4-query kernel has now refused three op-count reductions (x0.95,
+  x0.90, x0.985: H102, H102b, H112), so its bound is not the ops this
+  removes.
+- **A larger threshold sample for a tighter seed (17).** H104 measured
+  the smaller sample as a loss; the larger one adds ~7 us of serial time
+  per single query to save at most the ~5 us of compaction a one-thread
+  collector still does, and nothing on a pool, where no collector
+  compacts. Arithmetic.
+- **Four code streams in the x86 single-query sign scan (18).** The
+  scan reads 19.2 MB in 0.63 ms, 30 GB/s — the single-core supply P22
+  and P40 measured on this part (28-30). Roofline.
+- **Software prefetch in the arm single-query sign kernel (19).** That
+  scan runs at 22.8 GB/s against a supply of 37.8: it is bound by the
+  core, not by memory, as its exact predecessor was when H42, H48 and
+  H73 tried the same. Roofline.
+- **The sign plane as a dot product on arm — shared ±1 decode, then
+  SMMLA (20).** 1,152 vector ops per query per block at a batch of 12
+  against the LUT kernel's 1,104. Arithmetic.
+
+**20 consecutive non-wins: round 3 is done.**
+
+### Round 3 — closing summary
+
+Baseline: the round-2 HEAD (03fc2a2c). Branch `perf/2bit-hillclimb-3`,
+worktree `scratch/tv-2bit-hc3`. Everything below is behind
+`TURBOVEC_2BIT_PLANES=1` (default off) except the table-build and
+alignment changes, which also serve the exact path and leave its
+results bit-identical.
+
+**What it is.** A 2-bit code is a sign bit and a low bit. With the
+toggle on, an index of 32,768 vectors or more keeps its search cache as
+a contiguous sign region (blocked like a code buffer with half the
+byte-groups) and a low region (one row per vector), the same bytes per
+vector as before. A search scans the sign region with the existing
+nibble kernels for a shortlist of max(128, 12.8k), refines it through
+the low rows, and rescores the best max(32, 3k) with the exact scan's
+own arithmetic. The stored format is unchanged.
+
+**Wins (each `whm_2bit.py` VERDICT: WIN against the climb HEAD of the
+time, soaked on both boxes):**
+
+| win | change | 8-cell HM |
+|---|---|---|
+| H99 | sign-plane first pass, seeded buffered collector, exact rescore, same-RAM two-region cache | x1.4076 |
+| H103 (+H100) | refine pass before the rescore; exact tables built during the scan | x1.0473 |
+| H102 | deferred u8 widening, arm single-query sign kernel | x1.0141 |
+| H105 | the scan's owning worker spins instead of sleeping on rayon's latch | x1.0455 |
+| H107 (+H106) | parallel merge; finer split and in-range refine on arm | x1.0245 |
+| H110+H111 (+H108, H109) | faster table builds; tight rescore loops | x1.0477 |
+| H114 (+H113) | tree wake-up; seed computed inside the scan | x1.0112 |
+
+**Capstones, cumulative build vs the round-2 HEAD:** x1.7081 (`h114`)
+and x1.7531 (`h118`, with the arm caveat above); every cell x1.62 or
+better.
+
+**Gates on the final build:** ids identical to the exact scan for
+99.95-100% of 10,000 queries on OpenAI-1536, OpenAI-3072 and mpnet-768
+at k = 1, 10, 100, calibrated and not, and 99.96-100% of 5,000 single
+queries; every returned score the exact scan's bit pattern, on both
+arches; the exact scan's digests identical to the round-2 HEAD's;
+`cargo test -p turbovec` green with the toggle off, on, and on with the
+layout forced onto small indexes; RAM per vector unchanged (plus a fixed
+~150 KB threshold sample per index).
+
+**Not wins, kept in the tree to stack or as fixes:** H106 (arm in-range
+refine), H108, H113, H116, H118 (64-byte-aligned `vpermb` tables), the
+size gate. **Refuted and reverted:** H112, H115. **Refuted, never in
+the tree:** H104's sample and rescore-length changes, the 4-query forms
+of H102, P49.
+
+**What the probes found that outlives this round.**
+- P46: a `par_iter` over a few equal ranges leaves its owning worker
+  asleep on a latch for ~40 us after the work is done. Every
+  single-query search on a pool pays it, exact scan included.
+- P47: a batched scan's per-query merge ran serially after the region.
+- H116/H118: the `vpermb` tables' cache-line alignment was allocator
+  luck worth 6% on x86 between builds.
+- The sweep: without a size gate, small indexes lose to the two-stage
+  search's fixed costs.
+
+**The rig.** The round-2 boxes were stocked out, so the round ran on
+`turbovec-bench-search` as a `c3-highmem-8` and on
+`turbovec-bench-arm-search-r3`, a `c4a-standard-8` clone in
+us-central1-b. The x86 box flips between a fast and a slow
+single-thread regime inside a soak (P37), and late in the round arm's
+nq1_st went from a steady 0.84 ms to ~0.895 with an occasional 0.85 for
+every build. Both made one-cell floors a lottery; two verdicts were
+re-soaked for it (H107, H118) and both soaks are recorded each time.
+Raw results: `data/r3/`. Rig scripts: `r3_rig/`.
+
+**For Ryan.**
+1. Whether this ships on by default. It is exact with probability, not
+   by construction; the measured miss rate is at most 5 queries in
+   10,000 (mpnet-768, k=10).
+2. CI: a job that runs the suite with the toggle on (and one with
+   `TURBOVEC_PLANES_MIN_N=0`).
+3. Geometries it does not cover: `dim / 4` not a multiple of 8, x86
+   without VBMI/VNNI, the opt-in vm8 2-bit layout on arm. They keep the
+   classic layout.
+4. The environment knobs and the phase profile (`TURBOVEC_PLANES_*`)
+   are instrumentation; strip or keep.
+5. The 4-bit analogue. P45 measured its shortlist: scanning the top two
+   bits of a 4-bit code, a shortlist of 64 contained the exact top-10
+   for all 10,000 queries on OpenAI-1536.
+
+**What a round 4 should start from:** the scan is 86-96% of every
+batched cell and both batched kernels are at their formulation's bound
+(x86 on port 5's `vpermb`, arm on a NEON kernel that has refused three
+op reductions); x86's single-query scan is at memory supply. The
+remaining single-query MT cost is rayon's start ramp. Further 2-bit
+gains need either fewer bytes again or a different executor, not a
+tuning pass.
+
+---
+
+## Round 3 — PR preparation and final measurements (2026-10-02)
+
+Not hill-climb hypotheses: the work of turning the round into a PR against
+main 1.0.0 (ccab9f32), and what measuring on real embeddings found. Raw
+logs in `data/r3/pr/{arm,x86}`, scripts in `r3_rig/pr/`. Boxes: x86
+c3-standard-8; arm the round's clone, run as c4a-highcpu-8 (c4a-standard-8
+was stocked out).
+
+**Tree.** The sweep knobs (`TURBOVEC_PLANES_*`) and the phase profile are
+gone; their defaults are constants. `plane_probe.rs` is gone. Only
+`TURBOVEC_2BIT_PLANES` is read from the environment. Tests reach the layout
+through a thread-local override (`pack::PLANES_TEST`), `planes_tests.rs`.
+
+**The rig hid three things.** `cells_2bit.py` searches uniform [0, 1)
+vectors at k=10. On OpenAI / mpnet embeddings and across k:
+
+1. *A batch rescanned whole when one query came back short of its seed.*
+   About one query in a thousand does, so a batch of a thousand nearly
+   always paid two scans: at k <= 10 the batched two-stage search was
+   slower than the exact scan (x86 d=1536 N=100K k=10, 1 thread: 0.67 ms
+   against 0.57). Now only the short query is rescanned: 0.37 ms. (The
+   lone rescanned query on aarch64 needs the deferred-widening tables; the
+   first cut of the fix built the wrong ones and cost one query in 10,000.)
+2. *Large k.* The shortlist and rescore grow with k and the scan does not.
+   At k=64-100 the switch lost in up to half the cells (worst x0.76).
+   Probes: the shortlist cannot shrink (mpnet falls to 99.86% at 9.6k);
+   the rescore can (agreement identical from 3k down to 1.5k, collapses at
+   k); ranking was 384 scalar lookups per candidate; a seeded single-query
+   scan admitted four shortlists' worth of candidates and ranked all of
+   them inside its ranges. Landed: popcount ranking (`low_dot`), rescore
+   2k, seed overshoot `min(4, 1 + 6/sqrt(r_s))`, and on x86 one query on a
+   pool with a shortlist under 640 keeps the parallel exact rescore.
+3. *Structureless data.* On isotropic random unit vectors the two-stage
+   search returns the exact scan's ids for 4-7% of queries (75% of ids
+   shared; true nearest neighbour in the top 10 for 74% of queries against
+   86%, d=768). Real embeddings: 99.95-100%. Recorded in docs/api.md.
+
+**Final build (ae30405b) against main, 8 cells, N=200K dim=768 k=10** (min
+of 6 runs a side; the two-stage column measured before the large-k
+changes, which read the same on these cells within noise):
+
+| cell | main ms | default ms | x | switch on ms | x |
+|---|---|---|---|---|---|
+| arm nq100_mt | 17.107 | 16.778 | 1.020 | 10.170 | 1.682 |
+| arm nq100_st | 131.811 | 130.028 | 1.014 | 73.576 | 1.792 |
+| arm nq1_mt | 0.263 | 0.240 | 1.094 | 0.158 | 1.663 |
+| arm nq1_st | 1.635 | 1.629 | 1.004 | 0.844 | 1.937 |
+| x86 nq100_mt | 23.567 | 13.970 | 1.687 | 8.924 | 2.641 |
+| x86 nq100_st | 81.288 | 53.611 | 1.516 | 32.429 | 2.507 |
+| x86 nq1_mt | 0.417 | 0.366 | 1.138 | 0.236 | 1.765 |
+| x86 nq1_st | 1.270 | 1.247 | 1.019 | 0.688 | 1.846 |
+
+HM: default x1.145, switch on x1.925. 4-bit cells x0.98-1.04 (2 runs a
+side, noise).
+
+**Official suite (100K OpenAI, 1,000 queries, k=64), ms/query:**
+
+| script | main | default | switch on |
+|---|---|---|---|
+| arm d1536 st | 1.498 | 1.447 | 0.956 |
+| arm d1536 mt | 0.194 | 0.195 | 0.127-0.134 |
+| arm d3072 st | 3.143 | 3.111 | 1.939-1.965 |
+| arm d3072 mt | 0.405 | 0.400 | 0.243-0.247 |
+| x86 d1536 st | 1.076 | 0.634-0.651 | 0.579 |
+| x86 d1536 mt | 0.287 | 0.162 | 0.146-0.148 |
+| x86 d3072 st | 2.111 | 1.504-1.538 | 1.159-1.166 |
+| x86 d3072 mt | 0.500 | 0.308-0.309 | 0.272-0.274 |
+
+Suite recall (TQ and TQ+, d=1536 and d=3072) identical in all three
+columns. Exact-scan digests (`parity_2bit.py`) equal to main's.
+
+**k sweep, switch on over default, d=1536 N=100K** (`pr9.log`): every cell
+x0.96 or better through k=100; k=10 x1.26-1.89.
+
+**Gate, final build:** ids identical for 99.95-100% of 10,000 queries
+(OpenAI-1536 / 3072 N=200K, mpnet-768 N=41K; k = 1, 10, 100; calibrated
+and not; single-query 99.96-100% of 5,000), scores bitwise.
+`cargo test -p turbovec` release with the switch off and on, and the debug
+suites: green on both boxes; clippy 1.97.0 clean.
+
+**Memory.** The cache's allocations under the layout equal the classic
+layout's (test `the_layout_holds_the_same_bytes_per_vector`: 700,080 bytes
+against 700,160 after growth). RSS deltas were too noisy to read (+-50
+bytes per vector between identical configurations).
+
+**A test-suite trap found on the way.** `scalar_fallback_matches_simd_topk`
+sets a process-global switch, and the scalar path rounds scores 2 ulp
+differently; a test comparing two searches bit for bit failed 3 runs in 11
+when it overlapped. Gated with `SCALAR_FALLBACK_GATE`; 14 of 14 since. The
+helper that test uses generates only negative coordinates
+(`(s >> 33) / 2^31 - 1`), which makes every vector point the same way —
+left alone here, worth its own fix.

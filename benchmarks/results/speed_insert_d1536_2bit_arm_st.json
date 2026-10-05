@@ -3,8 +3,8 @@
   "bit_width": 2,
   "arch": "arm",
   "threading": "st",
-  "tq_single_add_us": 9.19,
-  "tq_batch100_add_us": 592.19,
-  "faiss_single_add_us": 70.08,
-  "faiss_batch100_add_us": 5756.53
+  "tq_single_add_us": 11.11,
+  "tq_batch100_add_us": 770.43,
+  "faiss_single_add_us": 69.97,
+  "faiss_batch100_add_us": 5743.94
 }

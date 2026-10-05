@@ -11,6 +11,179 @@ appears under each surface it touches.
 
 ## [Unreleased]
 
+## turbovec 1.1.1 (Python package) + turbovec 1.1.1 (Rust crate) — 2026-10-04
+
+Two fixes for masked search on indexes of 32,768 vectors or more, both
+reported against 1.1.0's single-query path (#554, #557). A selective
+mask no longer pays the thread pool's handoff, and a masked search on
+the staged route no longer falls to a slower per-lane route: at 32,768
+vectors, dim 384, 4-bit, a 10% mask is 87 µs on the c3 box (was 305 at
+one thread, 424 at eight) and 73 µs on the c4a box (was 200 / 213).
+Results are unchanged.
+
+### turbovec — Rust crate (current: 1.1.0 → next: 1.1.1)
+
+#### Fixed
+
+- **A selective mask no longer pays the pool handoff.** (#554) Since
+  1.0.0 a masked single-query search on an index of 32,768 vectors or
+  more was split across the thread pool whatever the mask allowed, so a
+  filter that left little to scan — a 10% allowlist, a single id — ran
+  slower on 16 threads than on one (≈2x in the report). The split now
+  counts the blocks the mask leaves allowed and runs on the calling
+  thread when they are fewer than the gate; a dense mask keeps the
+  parallel scan. `search::single_query_parallelizes_masked(n, mask)` is
+  the pool predicate for a masked search, alongside the unmasked
+  `single_query_parallelizes(n)`.
+- **A masked search on the staged route no longer falls off it.** (#557)
+  In 1.1.0 the staged search's shortlist collector ignored the mask, so a
+  masked search of an index of 32,768+ vectors on an AVX-512 or ARM host
+  took a slower per-lane route and ran 3–4x slower than the classic
+  kernels for a selective mask — slower than the same search unmasked.
+  The collectors now apply the block's mask word to their lanes, and a
+  masked search takes the staged route over the vectors the mask allows:
+  at 32,768 vectors, dim 384, 4-bit, a 10% mask is 87 µs on the c3 box
+  (was 302; classic 84) and 74 µs on the c4a box (was 197; classic 70).
+
+### turbovec — Python package (current: 1.1.0 → next: 1.1.1)
+
+#### Fixed
+
+- **A selective `mask=` or `allowlist=` no longer pays the pool
+  handoff.** (#554) See the crate entry; the binding keeps such a search
+  on the calling thread instead of entering the pool for it.
+- **A masked search on the staged route no longer falls off it.** (#557)
+  See the crate entry.
+
+## turbovec 1.1.0 (Python package) + turbovec 1.1.0 (Rust crate) — 2026-10-04
+
+Search is staged by default at both bit widths, and the file format is v8.
+
+**Faster search.** On 100K OpenAI embeddings on the official c4a and c3
+boxes, against 1.0.0: 4-bit search is **1.87x** (harmonic mean over 32
+cells — both chips, one and eight threads, 1,000-query batches and one
+query per call, k = 10 to 100; one query per call 2.3x–4.6x, batches
+1.1x–1.8x); 2-bit search is 1.2x–1.75x in the suite's batch cells. Against
+FAISS `IndexPQFastScan` in the benchmark suite, 4-bit is now 4.4x (was
+3.5x) and 2-bit 2.2x (was 1.5x). Returned scores are bit-identical to the
+whole-index scan's; the set of ids is approximate — 99.9–100% of queries
+return exactly the whole-index scan's ids on the embedding corpora
+measured, and suite recall is unchanged — with `TURBOVEC_4BIT_PLANES=0` /
+`TURBOVEC_2BIT_PLANES=0` keeping the whole-index scan.
+
+**The v8 format.** Files written by this release are v8: v7 with a unit
+layout byte, so an index of 32,768 vectors or more stores the bit planes
+its search cache holds and loads and saves by copying. v7 files still
+load, and a `sync()` into one rewrites it as v8 once. 1.0.0 cannot read a
+v8 file; `turbovec::convert` (or the `convert` example) writes a v7, v6 or
+v5 file for it, and reads any of them.
+
+### turbovec — Rust crate (current: 1.0.0 → next: 1.1.0)
+
+#### Added
+
+#### Added
+
+- **The v8 file format.** `write()`, `to_bytes()` and `sync()` now produce
+  the v8 container (magic `TV8\0`): v7 with one more superblock byte, the
+  *unit layout*. A block unit holds either the sequential-blocked rows (as
+  every v7 unit) or the block's bit planes in a canonical, arch-neutral
+  form — which is how an index of 32,768 vectors or more keeps its search
+  cache — so for such an index a load and a save are copies again instead
+  of conversions: on 100K × 1536 at 4 bits, load → first search is 16 ms
+  on c4a and 39-40 ms on c3 at one or eight threads (a v7 file of the
+  same index: 60-124 ms single-threaded), and a save is 5-10% faster
+  than the classic layout's.
+  Headers, redo ops, tail rows, the delta digest and the crash protocol
+  are v7's, and a unit is the same size in either layout. v7 files still
+  load; a `sync()` into one rewrites it as v8 once, as a calibration
+  change does. `turbovec::convert` reads and writes v5, v6, v7 and v8 in
+  every direction (and is the only remaining v7 writer); converting
+  re-containers the codes, never re-quantizes. See
+  [docs/api.md](docs/api.md#the-v8-container).
+
+#### Changed
+
+- **2-bit search is two-stage.** A 2-bit index of 32,768 vectors or more
+  keeps its search cache as separate sign and magnitude bit planes — the
+  same bytes per vector — and a search scans the sign plane for a
+  shortlist of `max(128, 12.8k)`, ranks it with both planes, and rescores
+  the best `max(32, 2k)` with the exact scan's arithmetic. Returned scores
+  are bit-identical to the whole-index scan's for the same id; the set of
+  ids is approximate: on OpenAI d=1536 / d=3072 (N=200K) and
+  all-mpnet-base-v2 d=768 (N=41K), 99.95–100% of 10,000 queries return
+  exactly the whole-index scan's ids at k = 1, 10 and 100, and suite
+  recall is unchanged; on isotropic random vectors only 4–7% do (75% of
+  ids shared). Against the whole-index scan on 100K OpenAI d=1536 it is
+  1.26x–1.89x at k=10 and 0.96x–1.59x at k=100 — the gain shrinks as `k`
+  grows, and a multi-threaded batch at k=100 can sit at parity. Files are
+  byte-identical either way. `TURBOVEC_2BIT_PLANES=0` in the environment
+  keeps the whole-index scan, read once per process; dimensions that are
+  not a multiple of 32 and x86 CPUs without AVX-512 VBMI + VNNI scan the
+  whole index as before. See
+  [docs/api.md](docs/api.md#two-stage-2-bit-search).
+- **4-bit search is staged.** A 4-bit index of 32,768 vectors or more keeps
+  its search cache as a sign plane and three lower bit planes — the same
+  bytes per vector — and a search scans the sign plane for a shortlist of
+  `max(256, 20k)` (`16k` from `k = 64`), ranks it with the next plane, keeps
+  `max(96, 6k)`, ranks those with all three lower planes, and rescores the
+  best `max(32, 1.5k)` with the exact scan's arithmetic. Returned scores are
+  bit-identical to the whole-index scan's for the same id; the set of ids is
+  approximate: on OpenAI d=1536 / d=3072 (N=200K) and all-mpnet-base-v2 d=768
+  (N=41K), 99.92–100% of 10,000 queries return exactly the whole-index scan's
+  ids at k = 1, 10 and 100, and suite recall is unchanged. On structureless
+  random vectors the id set differs for most queries: a shortlist of sign
+  bits cannot separate what has no structure. On 100K OpenAI d=1536, over 32
+  cells (`{arm, x86} x {1 thread, 8 threads} x {1,000-query batch, one query
+  per call} x k in {10, 32, 64, 100}`) it is **1.87x** the whole-index scan
+  (harmonic mean; 1.09x–4.57x, every cell faster): one query per call
+  2.25x–4.57x, batches 1.09x–1.84x; on d=3072 1.10x–5.65x. On an index of
+  about 40K vectors batches at k >= 64 run 0.80x–1.15x (the shortlist is
+  sized by k, so it is a larger share of a small index) and every other
+  cell is faster. Files are byte-identical either way.
+  The v8 file (below) stores the planes, so a load and a save stay
+  copies: on 100K x 1536, load -> first search 39 ms on c3 and 16 ms on
+  c4a (the classic layout's 32 and 16), saves 5-10% faster. Single adds
+  are ~20% faster and removes 3-4x faster on the planes layout. `TURBOVEC_4BIT_PLANES=0` in the environment keeps the
+  whole-index scan, read once per process. Indexes below 32,768 vectors,
+  dimensions that are not a multiple of 32, and x86 CPUs without AVX-512
+  VBMI + VNNI scan the whole index as before. See
+  [docs/api.md](docs/api.md#staged-4-bit-search).
+- **2-bit search is faster, with results unchanged.** The x86 AVX-512 batched
+  kernel no longer branches or spills per query inside a block and scores six
+  queries per pass; query preparation and the block epilogue are cheaper on
+  both architectures. Against 1.0.0 at N=200K, dim=768, k=10: harmonic mean
+  **1.14x** over eight cells (`{arm, x86} x {1 thread, all threads} x {nq=1,
+  nq=100}`) — x86 batched **1.52x** / **1.69x**, x86 single-query 1.02x /
+  1.14x, arm 1.00x–1.09x. On the benchmark suite's corpus (100K OpenAI
+  vectors, k=64) x86 goes from 1.076 to 0.651 ms/query at d=1536 single-
+  threaded and from 0.287 to 0.162 multi-threaded. Scores, ids and tie-break
+  order are bit-identical to 1.0.0, and 4-bit search is unchanged.
+
+### turbovec — Python package (current: 1.0.0 → next: 1.1.0)
+
+#### Changed
+
+- **2-bit search is two-stage.** `search()` on a 2-bit index of 32,768
+  vectors or more inherits the Rust crate's two-stage search: exact
+  scores, an approximate candidate set (99.95–100% of queries return the
+  whole-index scan's ids on the embedding corpora measured, 4–7% on random
+  vectors), 1.26x–1.89x at k=10 shrinking to parity in some cells by
+  k=100. `TURBOVEC_2BIT_PLANES=0` keeps the whole-index scan. See
+  [docs/api.md](docs/api.md#two-stage-2-bit-search).
+
+- **4-bit search is staged.** `search()` on a 4-bit index of 32,768 vectors
+  or more inherits the Rust crate's staged search: exact scores, an
+  approximate candidate set (99.92–100% of queries return the whole-index
+  scan's ids on the embedding corpora measured), **1.87x** over 1.0.0
+  across 32 cells on 100K OpenAI d=1536, one query per call 2.25x–4.57x.
+  `TURBOVEC_4BIT_PLANES=0` keeps the whole-index scan. See
+  [docs/api.md](docs/api.md#staged-4-bit-search).
+- **2-bit search is faster, with results unchanged.** `search()` inherits the
+  Rust crate's 2-bit kernel work: harmonic mean **1.14x** over eight cells
+  against 1.0.0, largest on x86 batched queries at **1.52x**–**1.69x**.
+  Scores, ids and tie-break order are bit-identical.
+
 ## turbovec 1.0.0 (Python package) + turbovec 1.0.0 (Rust crate) — 2026-08-18
 
 First stable release, and the two packages are now on one version — the

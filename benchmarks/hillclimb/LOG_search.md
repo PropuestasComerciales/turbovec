@@ -8350,3 +8350,647 @@ register, and the kernel measures at 93% of its streaming ceiling. The
 arm inner loop is closed. Remaining arm ideas must reduce *work*, not
 schedule it better — which is the uniform-codebook family, priced at
 -0.021 recall, or nothing.
+
+---
+
+# Round 2 (2026-10-02)
+
+Goal in `GOAL_4bit_r2.md`. New this round: the score is 32 cells on real
+embeddings (100K OpenAI d=1536; `{arm, x86} x {1 thread, all threads} x
+{1,000-query batch, one query per call} x k in {10, 32, 64, 100}`;
+`r4_rig/cells_real.py`, `r4_rig/score.py`), and a result may be exact or
+pass the probabilistic gate (>= 99.9% of queries return the exact scan's
+ids on OpenAI-1536 / 3072 and mpnet-768 at k = 1, 10, 100; returned scores
+are the exact 4-bit scores). Baseline: main once PR #549 merges; until then
+the PR's head (b17e08b7), which is the code main will have.
+
+Round 1 closed with every nq=1 cell at its memory roofline and both
+nq=100 kernels issue-bound. A first stage that reads a quarter of the
+bytes is the lever that argument leaves open, and the 2-bit round (PR
+#549) built the machinery for one: sign-plane scan, seeded collector,
+popcount ranking, exact rescore.
+
+## P1 — how large a shortlist does a coarse first stage need at 4 bits? (probe; not counted)
+
+**Probe.** `turbovec/src/plane_probe.rs` (ignored in-crate test, restored
+from round 3 of the 2-bit climb) dumps real 4-bit codes, the rotated /
+calibrated queries and the exact top-100; `r4_rig/p1_shortlist.py` scores
+every vector with a coarser estimate and reports, per query, the rank the
+estimate gives the worst of the exact top-k — the shortlist that query
+needs. 2,000 queries a corpus; N=100K (OpenAI) and 41K (mpnet).
+
+**Shortlist needed by 99.9% of queries** (worst of calibrated and not):
+
+| first stage | bytes read | corpus | k=1 | k=10 | k=100 |
+|---|---|---|---|---|---|
+| sign bit | 1/4 | OpenAI-1536 | 11 | 104 | 953 |
+| | | OpenAI-3072 | 7 | 58 | 492 |
+| | | mpnet-768 | 29 | 180 | 1,781 |
+| top 2 bits | 1/2 | OpenAI-1536 | 6 | 35 | 300 |
+| | | mpnet-768 | 8 | 48 | 416 |
+| top 3 bits | 3/4 | mpnet-768 | 5 | 23 | 184 |
+| all 4 bits, magnitude linear in its bits | 1 | OpenAI-1536 | 3 | 15 | 132 |
+| | | OpenAI-3072 | 2 | 15 | 123 |
+| | | mpnet-768 | 3 | 17 | 137 |
+
+(The exact levels in float need 12 at k=10 and 107 at k=100: the kernel's
+own int8 rounding moves a couple of ids at the boundary.)
+
+**Reading.** The sign plane alone needs about 18-30 candidates per result
+where 2-bit needed 12.8 — the sign is a smaller share of a 4-bit score —
+but it is still a few hundred to a couple of thousand out of 100K. The
+last row is the ranking stage: a 4-bit level's magnitude is close enough
+to linear in its three low bits (weighted fit) that a popcount ranking
+puts the exact top-k inside the first 1.4k-1.7k, so an exact rescore of 2k
+suffices, as at 2 bits. And the raw code bits make that sum linear without
+mirroring: with `r_j` the j-th low bit and `s` the sign bit, a level is
+`sgn * (a + sum_j b_j * m_j)` with `m_j = r_j` when `s = 1` and `1 - r_j`
+otherwise, so `sgn * b_j * m_j = b_j * (r_j - 1 + s)` — three weighted bit
+counts over the stored bit planes plus the sign score.
+
+**Plan (H1).** The 2-bit planes pipeline at 4 bits: sign region + the three
+low bit planes as rows (same bytes per vector); sign scan for
+`max(256, ~24k)`; popcount ranking over three planes; exact rescore of
+`max(32, 2k)` as the kernel's own integer dot product.
+
+## The rig, established (2026-10-02)
+
+`r4_rig/`: `cells_real.py` (16 cells an arch, each thread setting in its
+own process, a cell is the minimum over the repetitions), `score.py`
+(harmonic mean, floor 0.99), and three separate steps:
+
+| step | what | time | identical builds read |
+|---|---|---|---|
+| `smoke.sh` | one balanced pass (base, cand, cand, base), 3 reps | 100 s | within +-4% a cell: a screen |
+| `soak.sh` | two (noise check) or four (verdict) balanced passes, 5 reps | 6 / 10 min | batch +-1.8%, single query +-1-4% at two passes |
+| `gate.sh` | ids / score bits against the exact scan on the three corpora, plus suite recall | 15-25 min | run only on a soak win |
+
+The first cut ran the gate inside every measurement; that was the slow
+part and is why the three are split. Baseline `base4` = main at 4ef3086f
+(PR #549 and #551 merged). x86: c3-standard-8. arm: c4a-standard-8 in
+us-east1-b (a clone of the round's box; us-central1 was stocked out).
+
+## H1 — two-stage 4-bit search on bit planes: 1 bit, then 2, then 4 — WIN x1.72
+
+**Idea.** P1's plan. Behind `TURBOVEC_4BIT_PLANES=1` an index of 32,768+
+vectors keeps its cache as the sign region plus the three low bit planes
+as rows (the head of each packed row; the same bytes per vector, the
+stored format untouched). A search:
+
+1. scans the sign plane with the 2-bit round's kernels and seeded
+   collector for `max(256, 20k)`;
+2. ranks those on the sign score plus the top low plane (a 2-bit
+   estimate) and keeps `max(96, 6k)`;
+3. ranks those on all three low planes, the level modelled as
+   `alpha * sgn + sum_j beta_j * rho_j` (weighted least squares over the
+   level frequencies, `pack::planes_stats`), and keeps `max(32, 2k)`;
+4. rescores those as the permute-dot kernels' own integer dot product
+   (`exact4_sum`: AVX-512 mask-expand + `vpdpbusd`; NEON table-expand +
+   `smull`) and their fused multiply-add, so the score is bit-identical.
+
+**How it got from the first cut to a win** (each step a smoke on both
+boxes; cells are switch on over `base4`):
+
+| step | arm HM / floor | x86 HM / floor | what moved |
+|---|---|---|---|
+| first cut: sign 24k, rank all three planes, rescore 2k | 1.19 / 0.66 | — | single queries x2-3.7, batches at k >= 64 lose |
+| two-level ranking (top plane on 24k, all planes on 8k) | 1.24 / 0.77 | 1.51 / 0.83 | |
+| each pass prefetches only what it reads | 1.30 / 0.77 | 1.69 / 0.98 | the first pass was fetching 9 lines a candidate to read 3 |
+| sign 20k, second pass 6k, real k for the arm range cap | 1.37 / 0.82 | 1.81 / 1.09 | x86 passes |
+| aarch64: rank 32 candidates at once through the sign tables | 1.52 / 0.94 | 1.72 / 1.00 | NEON counts bits a byte at a time: the mask count was ~70 ns a plane, the scan's table kernel on gathered rows ~15 |
+| mask count keeps a short step (x86 prefetch pattern) | 1.52 / 0.94 | 1.81 / 1.04 | |
+| lane mask in the aarch64 collector; flatten only the shortlist | 1.56 / 0.93 | 1.87 / 1.06 | neither moved the last arm cell |
+| seed pre-pass split across the pool; seed margin `1 + 4/sqrt(r_s)` | 1.60 / 1.03 | 1.88 / 1.05 | the sample scan ran one query after another: 5.4 ms of a 1,000-query batch at k=100 |
+
+A phase profile (temporary instrumentation, not in the tree) drove each
+step; two guesses made without one — the collector's lane walk, the
+flatten — were wrong about the cell they were aimed at.
+
+**Soak (verdict), four balanced passes, ms/query, `base4` -> switch on:**
+
+| cell | k=10 | k=32 | k=64 | k=100 |
+|---|---|---|---|---|
+| arm batch 1 thread | 0.984 -> 0.744 x1.32 | 1.020 -> 0.812 x1.26 | 1.053 -> 0.912 x1.15 | 1.107 -> 1.021 x1.08 |
+| arm batch 8 threads | 0.111 -> 0.094 x1.18 | 0.127 -> 0.103 x1.24 | 0.136 -> 0.118 x1.16 | 0.134 -> 0.130 x1.03 |
+| arm single 1 thread | 3.590 -> 0.951 x3.77 | 3.636 -> 1.039 x3.50 | 3.700 -> 1.147 x3.22 | 3.863 -> 1.268 x3.05 |
+| arm single 8 threads | 0.507 -> 0.185 x2.74 | 0.522 -> 0.242 x2.16 | 0.551 -> 0.318 x1.74 | 0.605 -> 0.399 x1.52 |
+| x86 batch 1 thread | 0.674 -> 0.396 x1.70 | 0.702 -> 0.483 x1.45 | 0.744 -> 0.618 x1.20 | 0.799 -> 0.748 x1.07 |
+| x86 batch 8 threads | 0.157 -> 0.095 x1.66 | 0.165 -> 0.109 x1.51 | 0.177 -> 0.136 x1.30 | 0.200 -> 0.169 x1.19 |
+| x86 single 1 thread | 4.306 -> 0.838 x5.14 | 4.183 -> 0.906 x4.62 | 4.125 -> 1.026 x4.02 | 4.347 -> 1.151 x3.78 |
+| x86 single 8 threads | 1.063 -> 0.313 x3.40 | 1.086 -> 0.450 x2.42 | 1.134 -> 0.543 x2.09 | 1.218 -> 0.641 x1.90 |
+
+arm HM x1.587, floor x1.029; x86 HM x1.869, floor x1.068; 32 cells HM
+**x1.716**. The x86 single-thread baseline ran in the box's slow regime
+this session (4.1-4.3 ms against 3.4-3.5 in the smokes), which flatters
+those four ratios; in the smokes they read x3.5-4.9.
+
+**Gate, the soaked build, both boxes.** Ids identical to the exact scan
+for 10,000 queries: OpenAI-1536 and OpenAI-3072 (N=200K) 99.99-100% at
+k = 1, 10, 100; mpnet-768 (N=41K) 100% at k=1, 99.99% at k=10, 99.96-99.99%
+at k=100; one query per call 100% of 2,000. Scores bitwise equal on every
+matching id. Suite recall (TQ and TQ+, d=1536 and d=3072) identical with
+the switch off and on.
+
+**Tests.** `cargo test -p turbovec` (release), the debug suites and
+clippy 1.97.0: green on both boxes; the same with `TURBOVEC_2BIT_PLANES=1`.
+25 layout / index tests cover the 4-bit layout (kernels against a
+dimension-by-dimension sum, a shortlist that covers the index reproducing
+the exact scan bit for bit, saved bytes, mutations, growth, and the
+cache's allocations equal to the classic layout's).
+
+With `TURBOVEC_4BIT_PLANES=1` set for the whole suite, four tests fail,
+and they fail by design: `filtering::block_parallel_masked_dense_matches_reference`,
+`..._results_are_thread_count_invariant`, `..._prune_preserves_results_at_every_k`
+and `concurrent_search::tied_scores_agree_across_search_paths` demand the
+exact scan's top-k on a 4-bit index of 32,768+ *random* vectors, where the
+candidate set is approximate (the scores they return are still exact).
+The thread-count test is worth knowing about on its own: under the switch
+one query on an x86 pool with a small shortlist rescores it whole instead
+of ranking it, so on structureless data the ids can differ with the
+thread count.
+
+**Found by that run and fixed before the verdict stood:** loading a large
+4-bit index under the switch held the codes three times over (file image,
+packed copy, planes) and failed `adversarial_load_memory`'s 1.5x budget.
+`planes_from_seq_owned` now writes the low region over the front of the
+buffer it is given and allocates only the sign region. (The 2-bit loader
+has the same shape and is not covered by that test — a follow-up.)
+
+**Verdict: WIN.** HM x1.716 over 32 cells, floor x1.029; gate passed on
+three corpora; default tests green; bytes per vector and the file format
+unchanged. Consecutive non-wins: 0.
+
+## Rig, from H2 on
+
+Three box pairs run three hypotheses at once (Ryan: "use up to 6 boxes
+to run up to 3 hypotheses in parallel"): pair 1 = the round's boxes, pairs
+2 and 3 = clones from snapshots `tv-x86-search-r4` / `tv-arm-search-r4`
+(`turbovec-bench-search-p2` us-central1-c, `-p3` us-east1-b; arm `-p2`,
+`-p3` us-east1-b). Each hypothesis is smoked against the branch's last
+win with the switch on (`cand.sh ARCH TAG h<last>:planes`), soaked on the
+same pair if the smoke is not an obvious loss, and gated if the soak wins.
+
+## H2 — exact rescore 1.5k instead of 2k at 4 bits — WIN x1.014
+
+P1: the three-plane ranking puts the exact top-k inside its first 1.4k
+on every corpus; 2k was the 2-bit round's margin. Smoke vs H1 (switch
+on): arm HM 1.007 / floor 0.976, x86 1.027 / 0.986 — inside the smoke's
+noise, so soaked. **Soak (4 passes):** arm HM x1.0112, floor x0.9946
+(single_k10_mt); x86 HM x1.0178, floor x0.9927 (single_k100_mt); every
+batch cell at k >= 32 x1.007-1.026. **Gate:** mpnet k=100 99.95-99.98%,
+k=10 99.99%; OpenAI 99.99-100%; scores bitwise. Non-wins: 0.
+
+## H5 — exact rescore prefetch eight candidates ahead instead of four — NOT A WIN
+
+Smoke vs H2: arm HM x1.005 (floor 0.986), x86 x0.994 (floor 0.967). No
+cell moved beyond the smoke's noise either way; the gather's cost is not
+its lookahead. Not soaked. Non-wins: 1.
+
+## H3 — second ranking pass on 5k instead of 6k — NOT A WIN (x1.0096)
+
+Smoke vs H1: arm x1.011 / 0.977, x86 x1.007 / 0.988 (noise) — soaked.
+**Soak:** arm HM x1.0080 (floor 0.9943), x86 x1.0113 (floor 0.9906); the
+32 cells together x1.0096, under the x1.01 line. The gate ran because the
+x86 half won and passed (mpnet k=100 99.95-99.99%), so 5k is safe if a
+later change wants it. Non-wins: 2.
+
+## H4 — seed margin 3 / sqrt(r_s) instead of 4 — NOT A WIN
+
+Smoke vs H1: arm x1.013 / 0.987, x86 x1.007 / 0.983 — soaked. **Soak:**
+arm HM x1.0017 (floor 0.952, single_k10_st), x86 x1.0071 (floor 0.991).
+Fewer spares saved nothing the collector could show; the batch cells sit
+at x0.99-1.02 either way. (The gate ran by a scripting slip and passed.)
+Non-wins: 3.
+
+## H6 — shortlist floor 208 instead of 256 at 4 bits — NOT A WIN
+
+Only the k=10 cells can move. Smoke vs H2: those read x1.01-1.02 (x86
+single_k10_mt x1.05), everything else noise; HM x1.006 on both boxes.
+Eight cells at +2% cannot lift 32 past x1.01, so not soaked. Non-wins: 4.
+
+## H7 — one query on a pool runs the second ranking pass on the workers (from 128 candidates) — NOT A WIN
+
+Smoke vs H2: single_k64_mt x1.09 / x1.09 and single_k100_mt x1.11 / x1.07
+(arm / x86), as designed; but single_k32_mt x0.97 on both — at k=32 the
+pass is 160 candidates and the fork costs more than it spreads. HM x1.004
+/ x1.014. Not soaked; re-asked with a higher threshold as H9. Non-wins: 5.
+
+## H8 — branch-free query mask build (x86 ranking prep) — NOT A WIN
+
+P2 profile: x86 spends ~47 us a query building the ranking masks at one
+thread (arm's whole prep is 5 us). Smoke vs H2: x86 HM x0.990, every
+cell x0.97-1.02 and uniformly a little under — including cells the prep
+barely touches, which reads like the box's regime drift rather than the
+change — arm x1.004 (arm does not use the masks at 4 bits). Not soaked;
+worth a re-smoke when a pair is idle. Non-wins: 6.
+
+## H10 — x86 collector compress-stores the lanes over the threshold — NOT A WIN
+
+P3 probe: at one thread the x86 batched sign scan itself grows from 284
+to 390 ms per 1,000 queries between k=10 and k=100 (arm: 690 -> 777), the
+seed pre-pass 8 -> 26 ms, the flatten under 1 ms. Hypothesis: blocks with
+a lane over the threshold store all 32 scores and read them back a lane
+at a time. Smoke vs H2: x86 batch cells x0.98-0.99, HM x1.001; arm
+untouched (x0.996, noise). The push path is not where the growth is; it
+is spread over the merge select, the per-tile collector buffers and the
+slow-path count, each a few ms. Non-wins: 7.
+
+H8 re-smoked on pair 3 (a different x86 box): x86 HM x0.985, every cell
+x0.97-1.00 again. Twice on two boxes is the change, not drift: the
+branch-free loop is slower than the loop it replaced. Stays a non-win.
+
+## P4 — where x86's query preparation goes (probe; not counted)
+
+Timed inside the planes branch, 1,000 queries at one thread: x86 sign
+tables 7.1 ms, ranking masks (`build_low_planes`) 39.8 ms; arm sign
+tables 4.9 ms, masks 0 (arm ranks through the tables at 4 bits). At eight
+threads x86 masks are still 6.4 ms of a 95 ms k=10 batch. 40 us a query
+is 11% of a one-thread k=10 batch query and 6% of a single query.
+
+## H9 — one query on a pool runs the second ranking pass on the workers, from 320 candidates — WIN x1.014
+
+H7 with the threshold above k=32's 160. Smoke vs H2: single_k64_mt
+x1.09 / x1.09, single_k100_mt x1.12 / x1.05, nothing else moved. **Soak:**
+arm HM x1.0137 (floor 0.993), x86 x1.0142 (floor 0.998); single_k64_mt
+x1.10 / x1.09, single_k100_mt x1.12 / x1.10, batches x0.99-1.01. **Gate**
+unchanged (the candidate set is the same; only who ranks it changed):
+mpnet 99.95-99.99%, OpenAI 99.99-100%. Non-wins: 0 (H10 and the H8
+re-smoke, logged above, happened before this verdict landed; the count
+restarts here).
+
+## H12 — x86 one query on a pool ranks the first pass inside the scan's workers (shortlist >= 640) — NOT A WIN
+
+What arm does. Smoke vs H2: x86 single_k32/64/100_mt x0.94 / x0.95 /
+x0.91, HM x0.980; arm untouched. The 2-bit round's finding again (H106):
+on x86 the second fork-join costs more than the pass it spreads.
+Non-wins: 1 (since H9).
+
+## H13 — x86 one query on a pool ranks a small shortlist instead of rescoring it whole — NOT A WIN
+
+P2 read the whole-shortlist rescore at 100 us for 256 candidates and the
+serial ranking at ~40; the smoke says otherwise: x86 single_k10_mt x0.83,
+everything else flat (arm untouched). The parallel rescore is the better
+path there; the 100 us must be mostly fork and gather the ranking pays
+too. Non-wins: 2.
+
+## P5 — timeline of one query on a pool (probe; not counted)
+
+Marks per block range (start, us from the scan's entry), k=10 -> k=100,
+8 threads, N=100K:
+
+- arm: first wave starts at 16-25 -> 29-37 (the seed pre-pass runs on the
+  owner first and grows with r); each range ~60 us; second wave 72-85 ->
+  90-98; collected 142 -> 173; merged 144 -> 198; **shortlist 149 -> 271:
+  ~70 us at k=100 sit after the merge** — a full sort of every candidate
+  (~3,600) because the in-range hook is set, where the caller then keeps
+  the best `mid_len`.
+- x86: ranges 21-32 -> 40-50, 105-159 -> 107-128; collected 276 -> 236;
+  shortlist 283 -> 282. x86's single-query scan does not grow with k;
+  its rerank does (41 -> 197 us, which H9 and H11 address).
+
+## H11 — AVX-512 mask build for the x86 ranking (P4's 40 us a query) — WIN (x86 x1.056; arm untouched)
+
+Sixteen coordinates a step: weights by one multiply-add and truncation,
+the sign and each bit as 16-lane compare masks, bit-reversed into the
+plane bytes. A test pins it byte for byte to the scalar build. Smoke vs
+H2: x86 HM x1.050 (batch_k10_st x1.09). **Soak:** x86 HM x1.0560, every
+cell x1.0025-1.13; arm HM x0.9957, floor x0.983 (batch_k64_mt). The arm
+binary's search code is unchanged by this (the AVX-512 path is x86-only
+and arm never builds the masks at 4 bits), so arm was re-soaked alone:
+x0.9985, the same cell x0.972 — a code-placement effect of the build on
+one arm cell, not a change to what runs there. **Gate** (x86): mpnet
+99.95-99.99%, OpenAI 99.99-100%. Taken as a win on the x86 evidence; the
+arm floor reading is noted and will be re-read by the round's final soak
+against main. Non-wins: 0.
+
+## H14 — aarch64 one query on a pool: select instead of sorting every candidate after the merge — NOT A WIN by the letter (x1.0099)
+
+P5's 70 us. The scan keeps its best `k / 2` by selection where the
+in-range hook is set, and the caller keeps its `mid_len` by selection.
+Smoke vs H9: arm single_k100_mt x1.25, k64 x1.18, k32 x1.10, k10 x1.05.
+**Soak:** arm HM x1.0253 (single_k100_mt x1.23, k64 x1.17, k32 x1.08);
+x86, whose code this does not touch, HM x0.9950; 32 cells x1.0099. Not
+taken on its own; H15 carries the same change plus x86's in-range pass
+and is judged whole. Non-wins: 1 (since H11).
+
+## H16 — x86 ranking prefetch sixteen rows ahead instead of eight — NOT A WIN
+
+Smoke vs the head (H9+H11): x86 HM x0.983, batch and single cells alike
+x0.95-0.99; arm (untouched) x0.996. A longer burst evicts what the pass
+is about to read. Non-wins: 2 (since H11).
+
+## H18 — batched aarch64 scan: block-range cap from k/4 instead of k — NOT A WIN
+
+Smoke vs the head: arm HM x1.0006; the cell it was aimed at
+(batch_k100_mt) x0.974. More ranges mean more collectors to merge.
+Non-wins: 3 (since H11).
+
+## H19 — x86 batched scan: four queries a tile when the collectors hold >= 1,024 — NOT A WIN
+
+Only x86 batch cells at k >= 64 run differently. Smoke vs the head:
+batch_k100_mt x1.09, but batch_k100_st x0.985 and both k=64 cells
+x0.98-0.99 — fewer queries a tile costs the kernel more than the
+collectors gain at one thread. (The x86 single cells' +1-9% are untouched
+code.) Non-wins: 4 (since H11).
+
+## H20 — seed sample of 96 blocks instead of 48 — NOT A WIN
+
+Smoke vs the head: arm HM x0.972, x86 x0.975; every single-query cell
+down 2-8%. The pre-pass's own cost outweighs whatever the tighter
+threshold saves in spares. Non-wins: 5 (since H11).
+
+## H15 — selection instead of a full sort after the single-query merge; x86 ranks the first pass inside the scan's workers from 640 — WIN x1.019
+
+H14 plus H12 with the sort gone (P5). x86-only delta vs H14 soaked on
+pair 3: x86 HM x1.012 (single_k64_mt x1.08, single_k100_mt x1.09), arm
+identical code x1.000. **Soak of the whole against the head (H9+H11):**
+arm HM x1.0290 (single_k100_mt x1.24, k64 x1.17, k32 x1.08, k10 x1.04;
+floor 0.994), x86 HM x1.0093 (single_k100_mt x1.11, k64 x1.06; the
+untouched batch_k100_st read 0.982); 32 cells **x1.019**. **Gate** on
+both: mpnet 99.95-99.99%, OpenAI 99.99-100%. Non-wins: 0.
+
+## H17 — the second ranking pass reads two planes, not three (the first pass's term rides along) — WIN x1.013
+
+Smoke vs the head: x86 x1.015 (every cell up), arm x1.0005. **Soak:**
+x86 HM x1.0177 (floor 0.995; batch cells x1.00-1.02, single x1.00-1.05),
+arm x1.0080 (floor 0.990); 32 cells x1.013. **Gate** (x86): mpnet
+99.95-99.99%, OpenAI 99.99-100%. Non-wins: 0. H15 and H17 were measured
+against the same head and touch different code (the merge and the in-
+range hook; the ranking passes); the round's final soak reads them
+together.
+
+## H21 — seed sample of 32 blocks instead of 48 — NOT A WIN
+
+Smoke vs the head (H15+H17): arm HM x1.000, x86 x0.995; nothing beyond
+noise. 48 stays. Non-wins: 1 (since H17).
+
+## H22 — three block-range pieces per worker instead of two (one query on a pool) — NOT A WIN
+
+Smoke vs the head: arm HM x0.990 (single cells x0.98-0.99), x86 x0.995.
+More ranges, more collectors to merge. Non-wins: 2 (since H17).
+
+## H24 — x86 ranking step of four rows instead of eight — NOT A WIN
+
+Smoke vs the head: x86 HM x1.021 but batch_k100_mt x0.93 and
+single_k32_mt x0.97 (floor rule); arm untouched x0.994. Eight stays.
+Non-wins: 3 (since H17).
+
+## H23 — seed margin 3 / sqrt(r_s) for one query (4 for a batch) — NOT A WIN
+
+Smoke read arm x1.018; the soak vs the head: arm HM x1.009 (floor 0.987),
+x86 x1.006 (floor 0.981). Not above x1.01 on either. Non-wins: 4 (since
+H17).
+
+## H25 — sign-scan shortlist 16k instead of 20k — NOT A WIN (floor)
+
+Smoke vs the head: k >= 64 cells up 2-9% on both chips (x86 batch_k100
+x1.07-1.09, single_k64_mt x1.09), but arm batch_k32_st x0.976 and
+single_k10_st x0.976 (k=10 is identical code: the 256 floor), x86
+batch_k10_mt x0.948 (identical code). HM arm x1.011, x86 x1.032; fails
+the floor at k <= 32. H27 keeps 20k below k=64. Non-wins: 5 (since H17).
+
+## Round score so far — head (H1+H2+H9+H11+H15+H17) vs main 4ef3086f — x1.83
+
+Soak on pair 1 (ms per query for a batch, ms per call for one query;
+main -> head):
+
+| cell | k=10 | k=32 | k=64 | k=100 |
+|---|---|---|---|---|
+| arm batch 1 thread | 0.999 -> 0.747 x1.34 | 1.022 -> 0.801 x1.28 | 1.058 -> 0.892 x1.19 | 1.108 -> 0.993 x1.12 |
+| arm batch 8 threads | 0.112 -> 0.094 x1.19 | 0.126 -> 0.102 x1.24 | 0.135 -> 0.115 x1.17 | 0.135 -> 0.128 x1.05 |
+| arm single 1 thread | 3.635 -> 0.944 x3.85 | 3.684 -> 1.009 x3.65 | 3.738 -> 1.115 x3.35 | 3.952 -> 1.224 x3.23 |
+| arm single 8 threads | 0.523 -> 0.181 x2.89 | 0.529 -> 0.214 x2.47 | 0.571 -> 0.250 x2.28 | 0.604 -> 0.286 x2.11 |
+| x86 batch 1 thread | 0.642 -> 0.348 x1.85 | 0.659 -> 0.420 x1.57 | 0.700 -> 0.529 x1.32 | 0.763 -> 0.637 x1.20 |
+| x86 batch 8 threads | 0.156 -> 0.087 x1.78 | 0.161 -> 0.099 x1.62 | 0.174 -> 0.124 x1.40 | 0.196 -> 0.153 x1.28 |
+| x86 single 1 thread | 3.324 -> 0.729 x4.56 | 3.381 -> 0.824 x4.11 | 3.380 -> 0.948 x3.57 | 3.462 -> 1.061 x3.26 |
+| x86 single 8 threads | 0.988 -> 0.305 x3.24 | 1.001 -> 0.327 x3.06 | 1.058 -> 0.407 x2.60 | 1.127 -> 0.489 x2.31 |
+
+arm HM x1.680 (floor x1.054), x86 HM x2.014 (floor x1.198); 32 cells HM
+**x1.83**. Gate on both chips: mpnet 99.95-99.99%, OpenAI 99.99-100%,
+scores bitwise; recall at every k identical to main. (The x86 box ran
+in its fast regime for both builds this time, so x86's 1-thread cells
+read higher than H1's table.)
+
+## H26 — second-pass floor 64 instead of 96 (k=10 only) — NOT A WIN
+
+Smoke vs the head: the k=10 cells moved x0.99-1.03, the rest is noise;
+HM x0.995 on both chips. Non-wins: 6 (since H17).
+
+## H29 — x86 one query on a pool rescores shortlists under 1,024 whole (was 640) — NOT A WIN
+
+Smoke vs the head: the target cell single_k32_mt x0.90; x86 HM x0.973.
+Ranking 640 beats rescoring 640 whole, even spread over eight workers.
+Non-wins: 7 (since H17).
+
+## H28 — exact rescore 1.25k instead of 1.5k — NOT A WIN
+
+Smoke x1.012 on both chips; the soak vs the head: x86 HM x1.004, arm
+x1.007. 1.5k stays (and keeps the gate margin). Non-wins: 8 (since
+H17).
+
+## H27 — sign-scan shortlist 16k from k = 64 (20k below) — WIN x1.022
+
+Smoke: arm x1.018, x86 x1.027. **Soak vs the head (H15+H17):** arm HM
+x1.0192 (floor 0.995; batch k=64/100 x1.03, single_k100_mt x1.07,
+single_k64_mt x1.05), x86 HM x1.0252 (batch_k100 x1.06-1.08, batch_k64
+x1.05, single_k100_st x1.11; single_k32_mt x0.985 is identical code);
+32 cells x1.022. **Gate** on both chips: mpnet k=100 99.92-99.94%
+(was 99.95-99.98: the margin thinned, still above 99.9), OpenAI
+99.98-100%, scores bitwise. Non-wins: 0.
+
+## H30 — two accumulators in the exact-rescore kernels — NOT A WIN
+
+Smoke vs the head: arm x1.001, x86 x1.001. The dot chain is not the
+kernel's limit; the sign gather is. Non-wins: 1 (since H27).
+
+## H31 — aarch64 exact kernel spreads the plane bits in registers, sixteen groups at a time — NOT A WIN
+
+Kernel tests pass (bit-identical sums). Smoke vs the head (arm only):
+HM x0.997; single cells x0.98-1.01. The register spread costs as much as
+the `SPREAD8` lookups it replaces; the gather of sign bytes a lane at a
+time stays. Non-wins: 2 (since H27).
+
+## H32 — exact-rescore sign prefetch every other line — NOT A WIN
+
+Smoke vs the head: arm x1.000, x86 x1.001. Non-wins: 3 (since H27).
+
+## H33 — exact rescore prefetches two candidates ahead instead of four — NOT A WIN
+
+Smoke vs the head: arm x1.000 (single cells all x0.99), x86 x1.004.
+Four stays. Non-wins: 4 (since H27).
+
+## H34 — seed margin 5 / sqrt(r_s) instead of 4 — NOT A WIN
+
+Smoke vs the head: arm HM x0.986 (single_k64 x0.95-0.96), x86 x1.000.
+Four stays (3 and 5 both lose). Non-wins: 5 (since H27).
+
+## H35 — one block-range piece per worker instead of two (one query on a pool) — NOT A WIN
+
+Smoke vs the head: arm x1.001, x86 x1.001. Two stays. Non-wins: 6
+(since H27).
+
+## H36 — exact-rescore floor 24 instead of 32 (k=10) — NOT A WIN
+
+Smoke vs the head: arm x1.008 (k=10 cells x1.00-1.02), x86 x0.985
+(the x86 box's single cells drifted; k=10 itself x1.00). Non-wins: 7
+(since H27).
+
+## P6 — phase profile of the head (probe; not counted)
+
+1,000 queries, ms for the batch; one query, us. `shortlist` is the sign
+scan with its collectors; the cpu columns sum the per-query ranking
+passes and the exact rescore.
+
+| cell | shortlist | rerank | pass1 | pass2 | exact |
+|---|---|---|---|---|---|
+| arm batch 1 thread k=10 | 702 | 37 | 10.7 | 7.5 | 14.1 |
+| arm batch 1 thread k=100 | 765 | 187 | 63 | 46 | 67 |
+| arm batch 8 threads k=100 | 107 | 22.6 | 60 | 44 | 62 (cpu) |
+| arm one query 1 thread k=100 | 1,158 us | 189 us | 69 | 48 | 58 |
+| x86 batch 1 thread k=10 | 298 | 43 | 13.9 | 12.2 | 9.6 |
+| x86 batch 1 thread k=100 | 402 | 208 | 76 | 66 | 49 |
+| x86 batch 8 threads k=100 | 110 | 42 | 121 | 108 | 79 (cpu) |
+| x86 one query 1 thread k=100 | 1,058 us | 225 us | 74 | 70 | 53 |
+
+The arm batch scan is 0.70-0.77 ms a query at every k — 80-95% of the
+cell — and only x1.35 cheaper than main's 4-bit exact scan for a quarter
+of the bytes: the batched sign kernel (`scan_groups_neon`) widens every
+group to u16, where the one-query kernel (H102, `SIGN_LUT_CAP_NEON`)
+adds eight lookups in u8 first. x86's batch scan is 0.30-0.40 ms a
+query. The ranking passes and the rescore are each ~10% of a k=100
+batch query; at k=10 they are noise. Next: the batched arm sign scan.
+
+## H37 — aarch64 batched sign scan sums two byte-groups in u8 before widening (tables capped at 63) — NOT A WIN
+
+The batch twin of H102. Smoke vs the head: arm batch cells x0.99-1.01
+(HM x0.996), x86 untouched x0.998. The op count drops 7% on paper and
+nothing moves — as the 2-bit round found for the four-group version
+(register pressure in the 4-query kernel; its comment). Not pursued
+further: a spill check would need the disassembly. Non-wins: 8 (since
+H27).
+
+## P7 — the index already sits on huge pages (probe; not counted)
+
+Both boxes run THP `always`; a 100K x 1536 index process reports
+AnonHugePages 6.7 GB of 6.8 GB RSS. A `madvise` hypothesis is moot.
+
+## H38 — eight queries a tile for x86 sign scans instead of six — NOT A WIN
+
+Smoke vs the head: x86 batch cells x0.90-0.99, HM x0.966; arm untouched.
+Six holds at 1 bit as at 2 (H56). Non-wins: 9 (since H27).
+
+## H39 — aarch64 ranking prefetch two steps (64 rows) ahead — NOT A WIN
+
+Smoke vs the head: arm x1.001, x86 x0.996. Non-wins: 10 (since H27).
+
+## H40 — batched aarch64 scan: block-range cap from 2k instead of k — NOT A WIN
+
+Smoke vs the head: arm x0.999, x86 x1.002. k stays (k/4 lost too,
+H18). Non-wins: 11 (since H27).
+
+## H41 — five queries a tile for x86 sign scans — NOT A WIN
+
+Smoke vs the head (x86 only; arm untouched): HM x1.000, batch cells
+x0.97-1.01. Six stays. Non-wins: 12 (since H27).
+
+## H42 — one query on a pool spreads the exact rescore from 32 candidates (was 64) — NOT A WIN
+
+Smoke vs the head: the target cell single_k32_mt x0.89 on x86, x0.98 on
+arm; 48 candidates do not pay a fork-join. Non-wins: 13 (since H27).
+
+## H43 — one query on a pool spreads the second ranking pass from 192 candidates (was 320) — NOT A WIN
+
+Smoke vs the head: single_k32_mt x0.98-1.00; HM arm x1.009, x86 x0.999.
+320 stays (128 lost too, H7). Non-wins: 14 (since H27).
+
+## H44 — one query on a pool: the helpers scan slices of the seed sample instead of spinning — NOT A WIN
+
+Smoke vs the head: single-query 8-thread cells x0.92-0.98 on x86,
+x0.98 on arm. The owner must wait for every slice, including one a
+late-waking helper claimed, and eight small scans cost more set-up than
+one. Non-wins: 15 (since H27).
+
+## H45 — x86 ranking prefetch two steps (16 rows) ahead at an eight-row step — NOT A WIN
+
+Smoke vs the head (x86 only): HM x0.988, batch cells x0.98-1.00. The
+lookahead of eight rows is the right one on both chips (H16, H24, H39).
+Non-wins: 16 (since H27).
+
+## H46 — second pass on 5k instead of 6k, re-measured on the H27 head — NOT A WIN
+
+Smoke vs the head: arm x1.001, x86 x0.990. 6k stays. Non-wins: 17
+(since H27).
+
+## H47 — sign-scan shortlist 14k from k = 64 (was 16k) — NOT A WIN
+
+Smoke vs the head: arm HM x1.009, x86 x1.011 with single_k100_st x0.94;
+batch k >= 64 cells x1.02-1.05. Below the bar on arm and the floor on
+x86, and each step narrower thins the mpnet k=100 gate margin (99.92%
+at 16k). 16k stays. Non-wins: 18 (since H27).
+
+## H48 — no sign-byte prefetch in the exact rescore — NOT A WIN
+
+Smoke vs the head: arm x1.003, x86 x0.999: the streamer does follow the
+block, and the prefetches cost nothing either. Non-wins: 19 (since
+H27).
+
+## H49 — exact rescore in index order — NOT A WIN
+
+Smoke vs the head: arm x0.993, x86 x0.987. The sort costs more than the
+ordering saves. Non-wins: 20 (since H27). **The round's stop rule is
+met: twenty consecutive hypotheses without a win.**
+
+## Round 2 result — head (H1+H2+H9+H11+H15+H17+H27) vs main 4ef3086f — x1.87
+
+The stop rule was met at H49 (twenty non-wins after H27). Final soak on
+pair 1, four passes, ms per query (batch of 1,000) or per call (one
+query), main -> head:
+
+| cell | k=10 | k=32 | k=64 | k=100 |
+|---|---|---|---|---|
+| arm batch 1 thread | 0.985 -> 0.741 x1.33 | 1.012 -> 0.800 x1.27 | 1.052 -> 0.872 x1.21 | 1.105 -> 0.956 x1.16 |
+| arm batch 8 threads | 0.111 -> 0.094 x1.19 | 0.126 -> 0.101 x1.24 | 0.135 -> 0.112 x1.21 | 0.133 -> 0.123 x1.09 |
+| arm single 1 thread | 3.581 -> 0.946 x3.78 | 3.624 -> 1.006 x3.60 | 3.698 -> 1.092 x3.39 | 3.862 -> 1.193 x3.24 |
+| arm single 8 threads | 0.506 -> 0.179 x2.82 | 0.514 -> 0.214 x2.40 | 0.553 -> 0.235 x2.35 | 0.606 -> 0.270 x2.25 |
+| x86 batch 1 thread | 0.639 -> 0.348 x1.84 | 0.659 -> 0.419 x1.57 | 0.701 -> 0.509 x1.38 | 0.765 -> 0.609 x1.26 |
+| x86 batch 8 threads | 0.155 -> 0.087 x1.77 | 0.162 -> 0.099 x1.63 | 0.175 -> 0.117 x1.49 | 0.199 -> 0.142 x1.40 |
+| x86 single 1 thread | 3.342 -> 0.732 x4.57 | 3.351 -> 0.823 x4.07 | 3.447 -> 0.923 x3.73 | 3.465 -> 0.955 x3.63 |
+| x86 single 8 threads | 0.999 -> 0.303 x3.30 | 1.010 -> 0.327 x3.09 | 1.066 -> 0.401 x2.66 | 1.137 -> 0.470 x2.42 |
+
+arm HM x1.698 (floor x1.087), x86 HM x2.081 (floor x1.256); 32 cells HM
+**x1.87**, every cell faster. Gate on the final build (plane probe
+removed), both chips: mpnet k=100 99.92-99.94%, k=10 99.99%, OpenAI
+99.98-100%, scores bitwise; recall at every k identical to main.
+
+Follow-ups, not taken in this round: (1) the arm sign region could take
+x86's 4-byte-unit interleave in RAM (`pack::planes_slot`), halving the
+exact rescore's and table ranking's sign gathers (96 lines a candidate
+-> 48) — a kernel change to the arm scan (`LD4`), a day's work, worth
+~2% by P6; (2) the batch sign scans are at their kernels' issue limits
+(P6, P36) and the one-query 1-thread cells at the core's bandwidth
+(19 MB of sign bytes a query), so further gains need fewer bytes, not
+faster kernels; (3) with `TURBOVEC_2BIT_PLANES=1` on aarch64 nothing
+changed here (its tables and kernels are untouched).
+
+## P8 — does the staged search hold on the other real corpora, and on a small index? (probe; not counted)
+
+Soaks of the head (`final:planes`) against main's exact scan, 16 cells
+an arch, two passes:
+
+| corpus | arm HM | arm floor | x86 HM | x86 floor | what loses |
+|---|---|---|---|---|---|
+| OpenAI d=3072, 100K | x1.83 | x1.10 | x2.27 | x1.25 | nothing |
+| mpnet d=768, 41K | x1.31 | x0.82 | x1.32 | x0.80 | batch k=100 x0.80-0.94, batch k=64 x0.88-1.00 |
+| OpenAI d=1536 cut to 40K | x1.47 | x0.85 | x1.43 | x0.92 | batch k=100 x0.85-1.04, batch k=64 x1.01-1.15 |
+
+The size, not the dimension: a 1,600-wide shortlist (k=100) is 4% of a
+40K index, and the ranking passes plus the rescore cost a batch more
+than the quarter-width scan saves. Single queries win on every corpus
+(x1.3-3.7 at 40K).
+
+Capping the shortlist at a fortieth of the index (`min(S, N/40)`,
+unchanged from 64K vectors) recovers the speed (x86 floor x1.07, arm
+batch_k100_mt x0.96) but the mpnet k=100 gate falls to 99.41-99.45%,
+under the 99.9% bar. Not taken. The 32,768-vector gate stays, with the
+small-index large-k batch cost documented; raising the gate to 65,536
+would be the alternative.

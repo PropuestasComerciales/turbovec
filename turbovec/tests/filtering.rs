@@ -52,8 +52,15 @@ fn gaussian_normalized(n: usize, dim: usize, seed: u64) -> Vec<f32> {
 }
 
 fn build_index(n: usize, dim: usize, seed: u64) -> TurboQuantIndex {
+    build_index_bits(n, dim, seed, 4)
+}
+
+fn build_index_bits(n: usize, dim: usize, seed: u64, bits: usize) -> TurboQuantIndex {
+    if n >= 32_768 {
+        whole_index_scan();
+    }
     let data = gaussian_normalized(n, dim, seed);
-    let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+    let mut idx = TurboQuantIndex::new(dim, bits).unwrap();
     idx.add(&data);
     idx
 }
@@ -513,12 +520,29 @@ fn allowlist_survives_swap_remove() {
 /// Derived from the constant rather than hard-coded so raising the
 /// threshold (#336) cannot silently move these tests off the path they
 /// exist to cover.
+///
+/// An index this size takes the staged search by default, whose id set
+/// is approximate on structureless data like this (`planes_tests` covers
+/// that path on its own terms). These tests pin the whole-index
+/// block-parallel scan — still the path for dimensions off a multiple of
+/// 32 and for x86 without AVX-512 — so they opt out of the staged search
+/// for the process (`whole_index_scan`, read once, before any index this
+/// size is built).
 const BLOCK_PARALLEL_N: usize =
     (turbovec::search::SINGLE_QUERY_PARALLEL_MIN_BLOCKS + 44) * 32;
+const BLOCK_PARALLEL_BITS: usize = 4;
+
+/// Keep every index this process builds on the whole-index scan. The
+/// switches are read once, at the first cache an index of 32,768 or more
+/// vectors builds, so this runs before that.
+fn whole_index_scan() {
+    std::env::set_var("TURBOVEC_2BIT_PLANES", "0");
+    std::env::set_var("TURBOVEC_4BIT_PLANES", "0");
+}
 
 fn assert_masked_matches_reference(mask: &[bool], k: usize, seed: u64) {
     let dim = 64;
-    let idx = build_index(BLOCK_PARALLEL_N, dim, seed);
+    let idx = build_index_bits(BLOCK_PARALLEL_N, dim, seed, BLOCK_PARALLEL_BITS);
     let query = gaussian_normalized(1, dim, seed ^ 0xFFFF);
     let masked = idx.search_with_mask(&query, k, Some(mask));
     let (ref_scores, ref_indices) = reference_topk(&idx, &query, mask, k);
@@ -580,7 +604,7 @@ fn block_parallel_masked_tail_and_head_only() {
 #[test]
 fn block_parallel_masked_results_are_thread_count_invariant() {
     let dim = 64;
-    let idx = build_index(BLOCK_PARALLEL_N, dim, 0xF11D_2006);
+    let idx = build_index_bits(BLOCK_PARALLEL_N, dim, 0xF11D_2006, BLOCK_PARALLEL_BITS);
     let query = gaussian_normalized(1, dim, 0xF11D_2007);
     let mut mask = vec![false; BLOCK_PARALLEL_N];
     for (i, m) in mask.iter_mut().enumerate() {
@@ -685,7 +709,7 @@ fn empty_query_batch_is_not_a_panic_at_any_index_size() {
 fn block_parallel_prune_preserves_results_at_every_k() {
     let dim = 64;
     for &seed in &[0xBEEF_0001u64, 0xBEEF_0002, 0xBEEF_0003] {
-        let idx = build_index(BLOCK_PARALLEL_N, dim, seed);
+        let idx = build_index_bits(BLOCK_PARALLEL_N, dim, seed, BLOCK_PARALLEL_BITS);
         let all = vec![true; BLOCK_PARALLEL_N];
         for &k in &[1usize, 10, 64, 100] {
             let query = gaussian_normalized(1, dim, seed ^ 0xABCD);
